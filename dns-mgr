@@ -1,0 +1,1202 @@
+#!/usr/bin/env bash
+# =============================================================================
+# dns-mgr — Unified DNS · Traefik · Certificate Management
+# =============================================================================
+# Copyright (C) 2026 Andreas P.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# https://www.gnu.org/licenses/agpl-3.0.html
+# =============================================================================
+# Ort:    /usr/local/bin/dns-mgr  (LXC 120 / Traefik)
+# Rechte: chmod 750, chown root:root
+#
+# Abhängigkeiten: curl, jq, openssl, inotifywait (inotify-tools), ssh, scp
+# =============================================================================
+set -euo pipefail
+
+### ═══════════════════════════════════════════════════════════════════════════
+### KONFIGURATION
+### ═══════════════════════════════════════════════════════════════════════════
+
+# Konfigurationsdatei — wird bevorzugt geladen
+DNS_MGR_CONF="${DNS_MGR_CONF:-/etc/dns-mgr/dns-mgr.conf}"
+
+# Interne Defaults (werden durch Config-Datei überschrieben)
+PDNS_API=""
+PDNS_KEY=""
+TRAEFIK_CONF_DIR="/etc/traefik/conf.d"
+ACME_JSON="/var/lib/traefik/acme.json"
+ACME_RESOLVER="letsencrypt"
+MAILCOW_IP=""
+MAILCOW_KEY=""
+MAILCOW_IPV6=""
+MAILCOW_CERT_DIR="/opt/mailcow-dockerized/data/assets/ssl"
+MAILCOW_COMPOSE_DIR="/opt/mailcow-dockerized"
+HESTIA_IP=""
+HESTIA_USER="admin"
+HESTIA_ACCESS_KEY=""
+HESTIA_SECRET_KEY=""
+PUBLIC_IPV4=""
+IPV6_PREFIX=""
+MAIL_HOSTNAME=""
+SOA_HOSTMASTER=""
+NS_RECORDS=()
+declare -A CERT_TARGETS=()
+STATE_DIR="/var/lib/dns-mgr"
+
+# Config laden
+if [[ -f "$DNS_MGR_CONF" ]]; then
+  # shellcheck source=/etc/dns-mgr/dns-mgr.conf
+  source "$DNS_MGR_CONF"
+else
+  echo "FEHLER: Konfigurationsdatei nicht gefunden: ${DNS_MGR_CONF}" >&2
+  echo "  Erstelle sie mit: dns-mgr init-config" >&2
+  echo "  Oder setze: DNS_MGR_CONF=/pfad/zur/config dns-mgr <cmd>" >&2
+  exit 1
+fi
+
+# Abgeleitete Variablen (nach Config-Load, damit IPs gesetzt sind)
+MAILCOW_API="https://${MAILCOW_IP}/api/v1"
+HESTIA_API="https://${HESTIA_IP}:8083/api/"
+
+# State-Dateien
+MAILCOW_STATE="${STATE_DIR}/mailcow-domains.json"
+HESTIA_STATE="${STATE_DIR}/hestia-domains.json"
+MTA_STS_STATE="${STATE_DIR}/mta-sts-ids.json"
+
+### ═══════════════════════════════════════════════════════════════════════════
+### HILFSFUNKTIONEN
+### ═══════════════════════════════════════════════════════════════════════════
+
+log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+info() { echo "[$(date '+%Y-%m-%d %H:%M:%S')]   → $*"; }
+warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNUNG: $*" >&2; }
+die()  { echo "FEHLER: $*" >&2; exit 1; }
+
+ipv6_addr()      { echo "${IPV6_PREFIX}${1}"; }
+ipv6_from_ctid() { ipv6_addr "::${1}"; }
+safe_name()      { echo "${1//./-}"; }
+
+check_deps() {
+  local missing=()
+  for cmd in curl jq openssl ssh scp; do
+    command -v "$cmd" &>/dev/null || missing+=("$cmd")
+  done
+  [[ ${#missing[@]} -gt 0 ]] && \
+    die "Fehlende Abhängigkeiten: ${missing[*]} — apt install curl jq openssl openssh-client"
+}
+
+### ═══════════════════════════════════════════════════════════════════════════
+### POWERDNS API
+### ═══════════════════════════════════════════════════════════════════════════
+
+pdns_post() {
+  curl -sf -X POST \
+    -H "X-API-Key: ${PDNS_KEY}" -H "Content-Type: application/json" \
+    -d "$2" "${PDNS_API}${1}"
+}
+
+pdns_patch() {
+  curl -sf -X PATCH \
+    -H "X-API-Key: ${PDNS_KEY}" -H "Content-Type: application/json" \
+    -d "$2" "${PDNS_API}${1}"
+}
+
+pdns_get() {
+  curl -sf -H "X-API-Key: ${PDNS_KEY}" "${PDNS_API}${1}"
+}
+
+pdns_delete_zone() {
+  curl -sf -X DELETE -H "X-API-Key: ${PDNS_KEY}" \
+    "${PDNS_API}/servers/localhost/zones/${1}."
+}
+
+zone_exists() {
+  pdns_get "/servers/localhost/zones/${1}." 2>/dev/null | grep -q '"id"'
+}
+
+get_zone_for_domain() {
+  local domain="$1"
+  zone_exists "$domain" && { echo "$domain"; return; }
+  local parts; IFS='.' read -ra parts <<< "$domain"
+  local n=${#parts[@]}
+  for (( i=1; i<n-1; i++ )); do
+    local candidate; candidate=$(IFS='.'; echo "${parts[*]:$i}")
+    zone_exists "$candidate" && { echo "$candidate"; return; }
+  done
+  echo ""
+}
+
+create_zone() {
+  local domain="$1"
+  log "Lege Zone an: ${domain}"
+  local ns_json=""
+  for ns in "${NS_RECORDS[@]}"; do
+    [[ -n "$ns_json" ]] && ns_json+=","
+    ns_json+="\"${ns}\""
+  done
+  pdns_post "/servers/localhost/zones" \
+    "{\"name\":\"${domain}.\",\"kind\":\"Native\",\"nameservers\":[${ns_json}]}" \
+    || die "Zone ${domain} konnte nicht angelegt werden"
+  set_record "$domain" "@" "SOA" \
+    "${NS_RECORDS[0]} ${SOA_HOSTMASTER} $(date +%Y%m%d01) 3600 900 604800 300" 3600
+}
+
+set_record() {
+  local zone="$1" name="$2" type="$3" content="$4" ttl="${5:-300}"
+  local fqdn; [[ "$name" == "@" ]] && fqdn="${zone}." || fqdn="${name}.${zone}."
+  local payload
+  payload=$(jq -n \
+    --arg name    "$fqdn" \
+    --arg type    "$type" \
+    --argjson ttl "$ttl" \
+    --arg content "$content" \
+    '{rrsets:[{name:$name,type:$type,ttl:$ttl,changetype:"REPLACE",
+       records:[{content:$content,disabled:false}]}]}')
+  pdns_patch "/servers/localhost/zones/${zone}." "$payload" \
+    || warn "Record ${name} ${type} in Zone ${zone} fehlgeschlagen"
+}
+
+set_record_multi() {
+  local zone="$1" name="$2" type="$3" ttl="$4"; shift 4
+  local fqdn; [[ "$name" == "@" ]] && fqdn="${zone}." || fqdn="${name}.${zone}."
+  local records_json="[]"
+  for content in "$@"; do
+    records_json=$(echo "$records_json" \
+      | jq --arg c "$content" '. += [{content:$c,disabled:false}]')
+  done
+  local payload
+  payload=$(jq -n \
+    --arg name    "$fqdn" \
+    --arg type    "$type" \
+    --argjson ttl "$ttl" \
+    --argjson recs "$records_json" \
+    '{rrsets:[{name:$name,type:$type,ttl:$ttl,changetype:"REPLACE",records:$recs}]}')
+  pdns_patch "/servers/localhost/zones/${zone}." "$payload" \
+    || warn "Multi-Record ${name} ${type} in Zone ${zone} fehlgeschlagen"
+}
+delete_record() {
+  local zone="$1" name="$2" type="$3"
+  local fqdn; [[ "$name" == "@" ]] && fqdn="${zone}." || fqdn="${name}.${zone}."
+  pdns_patch "/servers/localhost/zones/${zone}." \
+    "{\"rrsets\":[{\"name\":\"${fqdn}\",\"type\":\"${type}\",\"changetype\":\"DELETE\"}]}"
+}
+
+set_ns_records() { set_record_multi "$1" "@" "NS" 3600 "${NS_RECORDS[@]}"; }
+
+get_mta_sts_id() {
+  local domain="$1"
+  mkdir -p "$STATE_DIR"
+  [[ -f "$MTA_STS_STATE" ]] || echo "{}" > "$MTA_STS_STATE"
+  local existing; existing=$(jq -r --arg d "$domain" '.[$d] // empty' "$MTA_STS_STATE")
+  if [[ -n "$existing" ]]; then
+    echo "$existing"
+  else
+    local new_id; new_id=$(date +%Y%m%d%H%M%S)
+    local tmp; tmp=$(mktemp)
+    jq --arg d "$domain" --arg id "$new_id" '.[$d] = $id' "$MTA_STS_STATE" > "$tmp"
+    mv "$tmp" "$MTA_STS_STATE"
+    echo "$new_id"
+  fi
+}
+
+### ═══════════════════════════════════════════════════════════════════════════
+### TRAEFIK CONFIG
+### ═══════════════════════════════════════════════════════════════════════════
+
+write_traefik_http() {
+  # write_traefik_http <service-name> <domain> [domain2 ...] -- <backend-url> [--insecure]
+  # --insecure: Backend-Zertifikat nicht prüfen (für selbstsignierte Certs wie pfSense, Proxmox)
+  local service_name="$1"; shift
+  local domains=() backend_url="" sep=0 insecure=0
+  for arg in "$@"; do
+    if [[ "$arg" == "--" ]]; then sep=1; continue; fi
+    if [[ "$arg" == "--insecure" ]]; then insecure=1; continue; fi
+    [[ $sep -eq 0 ]] && domains+=("$arg") || backend_url="$arg"
+  done
+  [[ -z "$backend_url" ]] && die "write_traefik_http: Backend-URL fehlt"
+
+  local rule="Host(\`${domains[0]}\`)"
+  for (( i=1; i<${#domains[@]}; i++ )); do
+    rule+=" || Host(\`${domains[$i]}\`)"
+  done
+
+  # serversTransport nur bei --insecure
+  local transport_line=""
+  [[ $insecure -eq 1 ]] && transport_line="        serversTransport: insecure"
+
+  log "Traefik HTTP: ${service_name} → ${backend_url}$([ $insecure -eq 1 ] && echo ' (insecure)')"
+  cat > "${TRAEFIK_CONF_DIR}/${service_name}.yml" <<EOF
+http:
+  routers:
+    ${service_name}:
+      rule: "${rule}"
+      entryPoints: [websecure]
+      tls:
+        certResolver: ${ACME_RESOLVER}
+      middlewares: [https-forward]
+      service: ${service_name}
+  services:
+    ${service_name}:
+      loadBalancer:
+        servers:
+          - url: "${backend_url}"
+${transport_line}
+EOF
+}
+
+write_traefik_http_san() {
+  # write_traefik_http_san <service-name> <main-domain> <san1> [san2...] -- <backend-url>
+  # Erstellt eine Route mit explizitem SAN-Zertifikat (für Mailcow multi-domain)
+  local service_name="$1" main_domain="$2"; shift 2
+  local sans=() backend_url="" sep=0
+  for arg in "$@"; do
+    [[ "$arg" == "--" ]] && { sep=1; continue; }
+    [[ $sep -eq 0 ]] && sans+=("$arg") || backend_url="$arg"
+  done
+  [[ -z "$backend_url" ]] && die "write_traefik_http_san: Backend-URL fehlt"
+
+  local rule="Host(\`${main_domain}\`)"
+  for san in "${sans[@]}"; do rule+=" || Host(\`${san}\`)"; done
+
+  local sans_yaml=""
+  for san in "${sans[@]}"; do sans_yaml+="              - ${san}"$'\n'; done
+
+  log "Traefik SAN-Route: ${service_name} → ${backend_url} (main: ${main_domain}, ${#sans[@]} SANs)"
+  cat > "${TRAEFIK_CONF_DIR}/${service_name}.yml" <<EOF
+http:
+  routers:
+    ${service_name}:
+      rule: "${rule}"
+      entryPoints: [websecure]
+      tls:
+        certResolver: ${ACME_RESOLVER}
+        domains:
+          - main: ${main_domain}
+            sans:
+${sans_yaml}      service: ${service_name}
+  services:
+    ${service_name}:
+      loadBalancer:
+        servers:
+          - url: "${backend_url}"
+        passHostHeader: true
+EOF
+}
+
+write_traefik_tcp() {
+  local service_name="$1" backend_addr="$2" listen_port="$3"
+  log "Traefik TCP: ${service_name} → ${backend_addr} (Port ${listen_port})"
+  cat > "${TRAEFIK_CONF_DIR}/${service_name}-tcp.yml" <<EOF
+tcp:
+  routers:
+    ${service_name}-tcp:
+      entryPoints: ["${service_name}-ep"]
+      rule: "HostSNI(\`*\`)"
+      service: ${service_name}-tcp
+  services:
+    ${service_name}-tcp:
+      loadBalancer:
+        servers:
+          - address: "${backend_addr}"
+EOF
+  warn "Entrypoint '${service_name}-ep' (Port ${listen_port}) muss in traefik.yml eingetragen sein"
+}
+
+remove_traefik_config() {
+  for f in "${TRAEFIK_CONF_DIR}/${1}.yml" "${TRAEFIK_CONF_DIR}/${1}-tcp.yml"; do
+    [[ -f "$f" ]] && rm -f "$f" && log "Traefik-Config gelöscht: ${f}"
+  done
+}
+
+# Mailcow SAN-Zertifikat-Route aus allen vorhandenen mail-*.yml neu aufbauen
+rebuild_mailcow_san_route() {
+  log "Aktualisiere Mailcow SAN-Route ..."
+
+  # main-Domain kommt immer aus MAIL_HOSTNAME (z.B. mail.nfsmw15.de)
+  # Das stellt sicher dass CERT_TARGETS und acme.json immer übereinstimmen
+  local main_domain="$MAIL_HOSTNAME"
+  local all_domains=()
+
+  for conf in "${TRAEFIK_CONF_DIR}"/mail-*.yml; do
+    [[ -f "$conf" ]] || continue
+    while IFS= read -r d; do
+      all_domains+=("$d")
+    done < <(grep -oP "Host\(\`\K[^\`]+" "$conf" 2>/dev/null || true)
+  done
+
+  if [[ ${#all_domains[@]} -eq 0 ]]; then
+    warn "rebuild_mailcow_san_route: keine Mail-Domains gefunden"
+    return 0
+  fi
+
+  # Sicherstellen dass main_domain auch in all_domains enthalten ist
+  local found=0
+  for d in "${all_domains[@]}"; do
+    [[ "$d" == "$main_domain" ]] && found=1
+  done
+  if [[ $found -eq 0 ]]; then
+    warn "rebuild_mailcow_san_route: MAIL_HOSTNAME (${main_domain}) nicht in Mail-Domains gefunden"
+    warn "Bitte dns-mgr add-mail <domain> fuer die MAIL_HOSTNAME-Domain aufrufen"
+    # Fallback: erste mail.* Domain nehmen
+    for d in "${all_domains[@]}"; do
+      [[ "$d" == mail.* ]] && { main_domain="$d"; break; }
+    done
+    warn "Fallback main-Domain: ${main_domain}"
+  fi
+
+  # SANs = alle Domains ausser main_domain
+  local sans=()
+  for d in "${all_domains[@]}"; do
+    [[ "$d" != "$main_domain" ]] && sans+=("$d")
+  done
+
+  write_traefik_http_san \
+    "mailcow-all" "$main_domain" "${sans[@]}" \
+    -- "https://${MAILCOW_IP}:443"
+
+  info "SAN main-Domain: ${main_domain} | ${#sans[@]} SANs"
+}
+
+### ═══════════════════════════════════════════════════════════════════════════
+### ZERTIFIKAT-DEPLOYMENT
+### ═══════════════════════════════════════════════════════════════════════════
+
+cert_extract() {
+  # cert_extract <main-domain> <out-cert> <out-key>
+  local domain="$1" out_cert="$2" out_key="$3"
+
+  local cert_b64 key_b64
+  cert_b64=$(jq -r --arg r "$ACME_RESOLVER" --arg d "$domain" \
+    '.[$r].Certificates[] | select(.domain.main == $d) | .certificate' \
+    "$ACME_JSON" 2>/dev/null || true)
+  key_b64=$(jq -r --arg r "$ACME_RESOLVER" --arg d "$domain" \
+    '.[$r].Certificates[] | select(.domain.main == $d) | .key' \
+    "$ACME_JSON" 2>/dev/null || true)
+
+  if [[ -z "$cert_b64" || "$cert_b64" == "null" ]]; then
+    warn "Kein Zertifikat für '${domain}' — verfügbare Domains:"
+    jq -r --arg r "$ACME_RESOLVER" '.[$r].Certificates[].domain.main' \
+      "$ACME_JSON" 2>/dev/null | sed 's/^/    /' || true
+    return 1
+  fi
+
+  echo "$cert_b64" | base64 -d > "$out_cert"
+  echo "$key_b64"  | base64 -d > "$out_key"
+
+  if ! openssl x509 -noout -in "$out_cert" 2>/dev/null; then
+    warn "Extrahiertes Zertifikat für ${domain} ist ungültig"; return 1
+  fi
+
+  local expiry sans
+  expiry=$(openssl x509 -noout -enddate -in "$out_cert" | cut -d= -f2)
+  sans=$(openssl x509 -noout -text -in "$out_cert" \
+    | grep -A1 "Subject Alternative" | tail -1 \
+    | tr ',' '\n' | grep -oP 'DNS:\K[^ ,]+' | tr '\n' ' ' 2>/dev/null || echo "—")
+  info "Gültig bis: ${expiry}"
+  info "SANs: ${sans}"
+}
+
+cert_deploy_target() {
+  local target_name="$1" force="${2:-0}"
+  local cfg="${CERT_TARGETS[$target_name]:-}"
+  [[ -z "$cfg" ]] && die "Unbekanntes Target '${target_name}'. Verfügbar: ${!CERT_TARGETS[*]}"
+
+  # Felder aus Konfig-String parsen (:-getrennt)
+  local host remote_cert remote_key reload_cmd main_domain
+  IFS=':' read -r host remote_cert remote_key reload_cmd main_domain <<< "$cfg"
+
+  log "=== Cert-Target: ${target_name} (${main_domain}) ==="
+
+  local tmp_dir; tmp_dir=$(mktemp -d)
+  # shellcheck disable=SC2064
+  trap "rm -rf '${tmp_dir}'" RETURN
+
+  cert_extract "$main_domain" "${tmp_dir}/cert.pem" "${tmp_dir}/key.pem" || return 1
+
+  if [[ -n "$host" ]]; then
+    # ── SSH-Deployment ─────────────────────────────────────────────────────
+    info "Übertrage nach ${host} ..."
+    scp -F /dev/null -q "${tmp_dir}/cert.pem" "root@${host}:${remote_cert}.new"
+    scp -F /dev/null -q "${tmp_dir}/key.pem"  "root@${host}:${remote_key}.new"
+
+    local result
+    result=$(ssh -F /dev/null "root@${host}" \
+      REMOTE_CERT="$remote_cert" REMOTE_KEY="$remote_key" FORCE="$force" \
+      bash <<'REMOTE'
+set -euo pipefail
+changed=0
+if ! cmp -s "${REMOTE_CERT}.new" "${REMOTE_CERT}" 2>/dev/null; then
+  install -m 0644 "${REMOTE_CERT}.new" "${REMOTE_CERT}"; changed=1
+fi
+if ! cmp -s "${REMOTE_KEY}.new" "${REMOTE_KEY}" 2>/dev/null; then
+  install -m 0600 "${REMOTE_KEY}.new" "${REMOTE_KEY}"; changed=1
+fi
+rm -f "${REMOTE_CERT}.new" "${REMOTE_KEY}.new"
+[[ "$changed" -eq 1 || "$FORCE" -eq 1 ]] && echo "updated" || echo "unchanged"
+REMOTE
+    )
+
+    if [[ "$result" == "updated" ]]; then
+      if [[ -n "$reload_cmd" ]]; then
+        info "Reload auf ${host}: ${reload_cmd}"
+        ssh -F /dev/null "root@${host}" "$reload_cmd" \
+          || warn "Reload fehlgeschlagen (nicht kritisch)"
+      fi
+      info "Aktualisiert"
+    else
+      info "Unverändert — kein Neustart"
+    fi
+  else
+    # ── Lokales Deployment ─────────────────────────────────────────────────
+    local changed=0
+    if ! cmp -s "${tmp_dir}/cert.pem" "$remote_cert" 2>/dev/null; then
+      install -m 0644 "${tmp_dir}/cert.pem" "$remote_cert"; changed=1
+    fi
+    if ! cmp -s "${tmp_dir}/key.pem" "$remote_key" 2>/dev/null; then
+      install -m 0600 "${tmp_dir}/key.pem" "$remote_key"; changed=1
+    fi
+    if [[ $changed -eq 1 || $force -eq 1 ]]; then
+      [[ -n "$reload_cmd" ]] && eval "$reload_cmd" || true
+      info "Lokal deployt"
+    else
+      info "Lokal unverändert"
+    fi
+  fi
+}
+
+### ═══════════════════════════════════════════════════════════════════════════
+### KOMMANDO: add-web
+### ═══════════════════════════════════════════════════════════════════════════
+
+cmd_add_web() {
+  local domain="" with_mail=0
+  local backend_ipv6; backend_ipv6=$(ipv6_addr "::118")
+
+  for arg in "$@"; do
+    case "$arg" in
+      --mail)    with_mail=1 ;;
+      --ipv6=*)  backend_ipv6="${arg#--ipv6=}" ;;
+      *)         domain="$arg" ;;
+    esac
+  done
+  [[ -z "$domain" ]] && die "add-web: Domain fehlt"
+
+  local zone; zone=$(get_zone_for_domain "$domain")
+  local is_subdomain=0
+
+  if [[ -z "$zone" ]]; then
+    create_zone "$domain"; set_ns_records "$domain"; zone="$domain"
+  elif [[ "$zone" != "$domain" ]]; then
+    is_subdomain=1; log "Subdomain ${domain} in Zone ${zone}"
+  else
+    log "Zone ${domain} existiert bereits"
+  fi
+
+  if [[ $is_subdomain -eq 1 ]]; then
+    local sub="${domain%.${zone}}"
+    set_record "$zone" "$sub"       "A"    "$PUBLIC_IPV4"
+    set_record "$zone" "$sub"       "AAAA" "$backend_ipv6"
+    set_record "$zone" "www.${sub}" "A"    "$PUBLIC_IPV4"
+    set_record "$zone" "www.${sub}" "AAAA" "$backend_ipv6"
+  else
+    set_record "$zone" "@"   "A"    "$PUBLIC_IPV4"
+    set_record "$zone" "@"   "AAAA" "$backend_ipv6"
+    set_record "$zone" "www" "A"    "$PUBLIC_IPV4"
+    set_record "$zone" "www" "AAAA" "$backend_ipv6"
+  fi
+
+  write_traefik_http "$(safe_name "$domain")" \
+    "$domain" "www.${domain}" -- "http://${HESTIA_IP}:80"
+
+  [[ $with_mail -eq 1 ]] && cmd_add_mail_records "$domain"
+  log "Web-Domain ${domain} eingerichtet"
+}
+
+### ═══════════════════════════════════════════════════════════════════════════
+### KOMMANDO: add-mail
+### ═══════════════════════════════════════════════════════════════════════════
+
+cmd_add_mail_records() {
+  local domain="$1"
+  [[ -z "$domain" ]] && die "add-mail: Domain fehlt"
+
+  local zone; zone=$(get_zone_for_domain "$domain")
+  if [[ -z "$zone" ]]; then
+    log "Zone für ${domain} nicht gefunden — lege Zone an"
+    create_zone "$domain"; set_ns_records "$domain"
+    set_record "$domain" "@" "A"    "$PUBLIC_IPV4"
+    set_record "$domain" "@" "AAAA" "$(ipv6_addr "::120")"
+    zone="$domain"
+  fi
+
+  log "Setze Mail-DNS-Records für ${domain}"
+
+  for sub in mail autoconfig autodiscover webmail mta-sts; do
+    set_record "$zone" "$sub" "A"    "$PUBLIC_IPV4"
+    set_record "$zone" "$sub" "AAAA" "$MAILCOW_IPV6"
+  done
+
+  set_record "$zone" "@" "MX" "10 mail.${domain}." 3600
+
+  # SPF gehört auf den Apex (@), nicht auf mail.*
+  set_record "$zone" "@" "TXT" \
+    "\"v=spf1 mx ip4:${PUBLIC_IPV4} ip6:${MAILCOW_IPV6} -all\""
+
+  local dkim_key
+  dkim_key=$(curl -sfk -H "X-API-Key: ${MAILCOW_KEY}" \
+    "${MAILCOW_API}/get/dkim/${domain}" \
+    | jq -r '.dkim_txt // empty' 2>/dev/null) || true
+  if [[ -n "$dkim_key" ]]; then
+    # Mailcow liefert dkim_txt bereits als kompletten TXT-Content
+    # (z.B. "v=DKIM1; k=rsa; p=...") — nur Anführungszeichen drum
+    # Falls der Key schon mit v=DKIM1 beginnt direkt nutzen, sonst Prefix ergänzen
+    if [[ "$dkim_key" == v=DKIM1* ]]; then
+      set_record "$zone" "dkim._domainkey" "TXT" "\"${dkim_key}\""
+    else
+      set_record "$zone" "dkim._domainkey" "TXT" "\"v=DKIM1; k=rsa; t=s; s=email; p=${dkim_key}\""
+    fi
+    info "DKIM-Record gesetzt"
+  else
+    warn "DKIM-Key von Mailcow nicht erhalten — bitte manuell nachtragen"
+    info "Abruf: curl -H 'X-API-Key: KEY' ${MAILCOW_API}/get/dkim/${domain}"
+  fi
+
+  set_record "$zone" "_dmarc" "TXT" \
+    "\"v=DMARC1; p=reject; rua=mailto:postmaster@${domain}; adkim=s; aspf=s\""
+
+  local mta_sts_id; mta_sts_id=$(get_mta_sts_id "$domain")
+  set_record "$zone" "_mta-sts" "TXT" "\"v=STSv1; id=${mta_sts_id}\""
+
+  set_record "$zone" "_smtp._tls" "TXT" \
+    "\"v=TLSRPTv1; rua=mailto:tlsrpt@${domain}\""
+
+  set_record "$zone" "_autodiscover._tcp" "SRV" "0 1 443 mail.${domain}." 3600
+
+  # Individuelle Route pro Domain (wird in SAN-Route zusammengefasst)
+  write_traefik_http "mail-$(safe_name "$domain")" \
+    "mail.${domain}" "webmail.${domain}" \
+    "autoconfig.${domain}" "autodiscover.${domain}" "mta-sts.${domain}" \
+    -- "https://${MAILCOW_IP}:443"
+
+  # Gemeinsames SAN-Zertifikat für alle Mail-Domains neu aufbauen
+  rebuild_mailcow_san_route
+
+  log "Mail-Records für ${domain} eingerichtet"
+  log ""
+  log "══ PTR-Records — manuell im Hetzner Robot setzen ══════════════════════"
+  log "   URL: https://robot.hetzner.com → Server → IPs → Reverse DNS"
+  log "   IPv4: ${PUBLIC_IPV4}  →  ${MAIL_HOSTNAME}"
+  log "   IPv6: ${MAILCOW_IPV6}  →  ${MAIL_HOSTNAME}"
+  log "═══════════════════════════════════════════════════════════════════════"
+}
+
+### ═══════════════════════════════════════════════════════════════════════════
+### KOMMANDO: add-service
+### ═══════════════════════════════════════════════════════════════════════════
+
+cmd_add_service() {
+  local domain="" backend_ip="" backend_port=""
+  local type="http" tcp_listen_port="" custom_ipv6="" no_dns=0 no_ipv6=0 insecure=0 no_traefik=0 explicit_zone=""
+
+  for arg in "$@"; do
+    case "$arg" in
+      --type=*)            type="${arg#--type=}" ;;
+      --tcp-listen-port=*) tcp_listen_port="${arg#--tcp-listen-port=}" ;;
+      --ipv6=*)            custom_ipv6="${arg#--ipv6=}" ;;
+      --no-dns)            no_dns=1 ;;
+      --no-ipv6)           no_ipv6=1 ;;
+      --no-traefik)        no_traefik=1 ;;
+      --insecure)          insecure=1 ;;
+      --subdomain-of=*)    explicit_zone="${arg#--subdomain-of=}" ;;
+      *)
+        if   [[ -z "$domain"       ]]; then domain="$arg"
+        elif [[ -z "$backend_ip"   ]]; then backend_ip="$arg"
+        elif [[ -z "$backend_port" ]]; then backend_port="$arg"
+        fi ;;
+    esac
+  done
+
+  [[ -z "$domain"       ]] && die "add-service: Domain fehlt"
+  [[ -z "$backend_ip"   ]] && die "add-service: Backend-IP fehlt"
+  [[ -z "$backend_port" ]] && die "add-service: Backend-Port fehlt"
+
+  local target_ipv6
+  if [[ -n "$custom_ipv6" ]]; then
+    if   [[ "$custom_ipv6" == ::* ]];       then target_ipv6=$(ipv6_addr "$custom_ipv6")
+    elif [[ "$custom_ipv6" =~ ^[0-9]+$ ]];  then target_ipv6=$(ipv6_from_ctid "$custom_ipv6")
+    else                                          target_ipv6="$custom_ipv6"
+    fi
+  else
+    local last_octet="${backend_ip##*.}"
+    target_ipv6=$(ipv6_from_ctid "$last_octet")
+    warn "IPv6 aus IP abgeleitet: ${target_ipv6} — bei Bedarf --ipv6=::CTID angeben"
+  fi
+
+  local svc_name; svc_name=$(safe_name "$domain")
+
+  if [[ $no_dns -eq 0 ]]; then
+    local zone="${explicit_zone:-$(get_zone_for_domain "$domain")}"
+    if [[ -z "$zone" ]]; then
+      create_zone "$domain"; set_ns_records "$domain"; zone="$domain"
+      set_record "$zone" "@" "A" "$PUBLIC_IPV4"
+      [[ $no_ipv6 -eq 0 ]] && set_record "$zone" "@" "AAAA" "$target_ipv6"
+    elif [[ "$zone" == "$domain" ]]; then
+      set_record "$zone" "@" "A" "$PUBLIC_IPV4"
+      [[ $no_ipv6 -eq 0 ]] && set_record "$zone" "@" "AAAA" "$target_ipv6"
+    else
+      local sub="${domain%.${zone}}"
+      set_record "$zone" "$sub" "A" "$PUBLIC_IPV4"
+      [[ $no_ipv6 -eq 0 ]] && set_record "$zone" "$sub" "AAAA" "$target_ipv6"
+    fi
+  fi
+
+  local insecure_flag=""
+  [[ $insecure -eq 1 ]] && insecure_flag="--insecure"
+
+  if [[ $no_traefik -eq 1 ]]; then
+    log "Traefik übersprungen (--no-traefik) — Dienst läuft direkt per NAT"
+  elif [[ "$type" == "tcp" ]]; then
+    [[ -z "$tcp_listen_port" ]] && die "TCP benötigt --tcp-listen-port=<port>"
+    write_traefik_tcp "$svc_name" "${backend_ip}:${backend_port}" "$tcp_listen_port"
+  else
+    local backend_url="http://${backend_ip}:${backend_port}"
+    [[ $insecure -eq 1 ]] && backend_url="https://${backend_ip}:${backend_port}"
+    write_traefik_http "$svc_name" "$domain" -- "$backend_url" $insecure_flag
+  fi
+
+  local ipv6_info="${target_ipv6}"
+  [[ $no_ipv6 -eq 1 ]] && ipv6_info="(kein AAAA)"
+  local traefik_info=""
+  [[ $no_traefik -eq 1 ]] && traefik_info=" (kein Traefik — direkt per NAT)"
+  log "Dienst ${domain} eingerichtet (${type}) → ${backend_ip}:${backend_port} | IPv6: ${ipv6_info}${traefik_info}"
+}
+
+
+### ═══════════════════════════════════════════════════════════════════════════
+### KOMMANDO: add-srv
+### Generischer SRV-Record anlegen
+### ═══════════════════════════════════════════════════════════════════════════
+
+cmd_add_srv() {
+  # add-srv <zone> <service> <proto> <priority> <weight> <port> <target>
+  # Beispiel: dns-mgr add-srv nfsmw15.de mumble tcp 0 10 64739 mumble.nfsmw15.de
+  local zone="${1:-}" service="${2:-}" proto="${3:-tcp}"
+  local priority="${4:-0}" weight="${5:-10}" port="${6:-}" target="${7:-}"
+
+  [[ -z "$zone"    ]] && die "add-srv: Zone fehlt"
+  [[ -z "$service" ]] && die "add-srv: Service fehlt (z.B. mumble, sip, xmpp)"
+  [[ -z "$port"    ]] && die "add-srv: Port fehlt"
+  [[ -z "$target"  ]] && die "add-srv: Target-Hostname fehlt"
+
+  # Target muss mit Punkt enden (FQDN)
+  [[ "$target" != *. ]] && target="${target}."
+
+  local srv_name="_${service}._${proto}.${zone}."
+  local srv_content="${priority} ${weight} ${port} ${target}"
+
+  log "SRV-Record: ${srv_name} → ${srv_content}"
+
+  local payload
+  payload=$(jq -n \
+    --arg name    "$srv_name" \
+    --arg content "$srv_content" \
+    '{rrsets:[{name:$name,type:"SRV",ttl:300,changetype:"REPLACE",
+       records:[{content:$content,disabled:false}]}]}')
+
+  pdns_patch "/servers/localhost/zones/${zone}." "$payload" \
+    && log "SRV-Record gesetzt" \
+    || warn "SRV-Record fehlgeschlagen"
+}
+
+### ═══════════════════════════════════════════════════════════════════════════
+### KOMMANDO: remove
+### ═══════════════════════════════════════════════════════════════════════════
+
+cmd_remove() {
+  local domain="${1:-}" force=0
+  [[ "${2:-}" == "--force" ]] && force=1
+  [[ -z "$domain" ]] && die "remove: Domain fehlt"
+
+  if [[ $force -eq 0 ]]; then
+    read -r -p "Zone ${domain} und Traefik-Config löschen? [j/N] " confirm
+    [[ "$confirm" != "j" && "$confirm" != "J" ]] && { log "Abgebrochen"; exit 0; }
+  fi
+
+  if zone_exists "$domain"; then
+    pdns_delete_zone "$domain"; log "Zone ${domain} gelöscht"
+  else
+    log "Zone ${domain} nicht gefunden"
+  fi
+
+  remove_traefik_config "$(safe_name "$domain")"
+  remove_traefik_config "mail-$(safe_name "$domain")"
+  remove_traefik_config "mta-sts-$(safe_name "$domain")"
+  rebuild_mailcow_san_route
+  log "Domain ${domain} entfernt"
+}
+
+### ═══════════════════════════════════════════════════════════════════════════
+### KOMMANDO: mailcow-sync
+### ═══════════════════════════════════════════════════════════════════════════
+
+cmd_mailcow_sync() {
+  log "Mailcow-Domain-Sync"
+  mkdir -p "$STATE_DIR"
+  [[ -f "$MAILCOW_STATE" ]] || echo "[]" > "$MAILCOW_STATE"
+
+  # Verbindungstest
+  local http_code
+  http_code=$(curl -sk -o /dev/null -w "%{http_code}" \
+    -H "X-API-Key: ${MAILCOW_KEY}" "${MAILCOW_API}/get/domain/all") || true
+  case "$http_code" in
+    000) die "Mailcow nicht erreichbar (${MAILCOW_IP}) — LXC online?" ;;
+    401) die "Mailcow-API: falscher Key — MAILCOW_KEY in dns-mgr.conf prüfen" ;;
+  esac
+
+  local current_domains
+  current_domains=$(curl -sfk -H "X-API-Key: ${MAILCOW_KEY}" \
+    "${MAILCOW_API}/get/domain/all" \
+    | jq '[.[].domain_name]' 2>/dev/null) \
+    || die "Mailcow-API: ungültige Antwort"
+
+  local new_domains
+  new_domains=$(jq -rn \
+    --argjson cur "$current_domains" \
+    --argjson known "$(cat "$MAILCOW_STATE")" \
+    '($cur - $known)[]')
+
+  if [[ -z "$new_domains" ]]; then
+    log "Keine neuen Mailcow-Domains"
+    echo "$current_domains" > "$MAILCOW_STATE"
+    return 0
+  fi
+
+  while IFS= read -r domain; do
+    [[ -z "$domain" ]] && continue
+    log "Neue Mailcow-Domain: ${domain}"
+    if zone_exists "$domain"; then
+      cmd_add_mail_records "$domain"
+    else
+      cmd_add_web "$domain"
+      cmd_add_mail_records "$domain"
+    fi
+  done <<< "$new_domains"
+
+  echo "$current_domains" > "$MAILCOW_STATE"
+  log "Mailcow-Sync abgeschlossen"
+}
+
+### ═══════════════════════════════════════════════════════════════════════════
+### KOMMANDO: deploy-certs
+### ═══════════════════════════════════════════════════════════════════════════
+
+cmd_deploy_certs() {
+  local filter_target="" force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --target) filter_target="$2"; shift 2 ;;
+      --force)  force=1; shift ;;
+      *) die "deploy-certs: unbekannter Parameter '$1'" ;;
+    esac
+  done
+
+  [[ ! -f "$ACME_JSON" ]] && die "acme.json nicht gefunden: ${ACME_JSON}"
+
+  local total=0 success=0 skipped=0
+  for target_name in "${!CERT_TARGETS[@]}"; do
+    [[ -n "$filter_target" && "$target_name" != "$filter_target" ]] && continue
+    (( total++ )) || true
+    if cert_deploy_target "$target_name" "$force"; then
+      (( success++ )) || true
+    else
+      (( skipped++ )) || true
+    fi
+  done
+  log "Fertig: ${success}/${total} erfolgreich, ${skipped} übersprungen"
+}
+
+### ═══════════════════════════════════════════════════════════════════════════
+### KOMMANDO: watch-certs  (läuft dauerhaft als systemd-Service)
+### ═══════════════════════════════════════════════════════════════════════════
+
+cmd_watch_certs() {
+  local settle=15
+  [[ "${1:-}" == --settle=* ]] && settle="${1#--settle=}"
+
+  command -v inotifywait &>/dev/null \
+    || die "inotifywait fehlt: apt install inotify-tools"
+  [[ ! -f "$ACME_JSON" ]] && die "acme.json nicht gefunden: ${ACME_JSON}"
+
+  log "Überwache ${ACME_JSON} (settle: ${settle}s) ..."
+
+  inotifywait -m -e close_write --format '%f' "$(dirname "$ACME_JSON")" \
+  | while IFS= read -r filename; do
+      [[ "$filename" != "$(basename "$ACME_JSON")" ]] && continue
+      log "acme.json geändert — warte ${settle}s ..."
+      sleep "$settle"
+      log "Starte deploy-certs ..."
+      if cmd_deploy_certs; then
+        log "deploy-certs erfolgreich"
+      else
+        warn "deploy-certs mit Fehler beendet"
+      fi
+    done
+}
+
+### ═══════════════════════════════════════════════════════════════════════════
+### KOMMANDO: cert-list
+### ═══════════════════════════════════════════════════════════════════════════
+
+cmd_cert_list() {
+  echo ""
+  echo "Konfigurierte Cert-Targets (in CERT_TARGETS):"
+  printf "  %-15s  %-35s  %s\n" "NAME" "MAIN-DOMAIN" "HOST"
+  printf "  %-15s  %-35s  %s\n" "----" "-----------" "----"
+  for name in "${!CERT_TARGETS[@]}"; do
+    IFS=':' read -r host _ _ _ domain <<< "${CERT_TARGETS[$name]}"
+    printf "  %-15s  %-35s  %s\n" "$name" "$domain" "${host:-lokal}"
+  done
+
+  echo ""
+  echo "Zertifikate in acme.json:"
+  if [[ ! -f "$ACME_JSON" ]]; then
+    echo "  acme.json nicht gefunden: ${ACME_JSON}"
+  else
+    local certs
+    certs=$(jq -r --arg r "$ACME_RESOLVER" \
+      '.[$r].Certificates // [] | length' \
+      "$ACME_JSON" 2>/dev/null || echo "0")
+    if [[ "$certs" == "0" || "$certs" == "null" || -z "$certs" ]]; then
+      echo "  Noch keine Zertifikate ausgestellt"
+      echo "  (werden nach der ersten Domain-Umschaltung automatisch erstellt)"
+    else
+      jq -r --arg r "$ACME_RESOLVER" \
+        '.[$r].Certificates[] |
+         "  \(.domain.main)\n    SANs: \(.domain.sans // [] | join(", "))"' \
+        "$ACME_JSON" 2>/dev/null
+    fi
+  fi
+}
+
+### ═══════════════════════════════════════════════════════════════════════════
+### KOMMANDO: list
+### ═══════════════════════════════════════════════════════════════════════════
+
+cmd_list() {
+  echo ""
+  echo "PowerDNS-Zonen:"
+  pdns_get "/servers/localhost/zones" \
+    | jq -r '.[].name' | sed 's/\.$//' | sort \
+    | while read -r z; do printf "  %s\n" "$z"; done
+
+  echo ""
+  echo "Traefik-Configs (${TRAEFIK_CONF_DIR}):"
+  ls -1 "${TRAEFIK_CONF_DIR}"/*.yml 2>/dev/null \
+    | xargs -I{} basename {} .yml | sort \
+    | while read -r n; do printf "  %s\n" "$n"; done
+
+  echo ""
+  cmd_cert_list
+}
+
+
+### ═══════════════════════════════════════════════════════════════════════════
+### KOMMANDO: hestia-sync
+### Pollt HestiaCP-API, legt neue/entfernte Domains in PowerDNS + Traefik an
+### ═══════════════════════════════════════════════════════════════════════════
+
+cmd_hestia_sync() {
+  log "HestiaCP-Domain-Sync"
+  mkdir -p "$STATE_DIR"
+  [[ -f "$HESTIA_STATE" ]] || echo "{}" > "$HESTIA_STATE"
+
+  # HestiaCP REST-API: access_key + secret_key als POST-Felder
+  local hestia_auth="access_key=${HESTIA_ACCESS_KEY}&secret_key=${HESTIA_SECRET_KEY}"
+
+  # Verbindungstest
+  local hc_code
+  hc_code=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "${HESTIA_API}" \
+    --data "${hestia_auth}&cmd=v-list-users&arg1=json") || true
+  case "$hc_code" in
+    000) die "HestiaCP nicht erreichbar (${HESTIA_IP}) — LXC online?" ;;
+    200) : ;;
+    *)   die "HestiaCP-API HTTP ${hc_code} — Keys und IP-Whitelist prüfen (Einstellungen → Sicherheit)" ;;
+  esac
+
+  # Alle User abrufen
+  local all_users
+  all_users=$(curl -sk -X POST "${HESTIA_API}" \
+    --data "${hestia_auth}&cmd=v-list-users&arg1=json" \
+    | jq -r 'keys[]' 2>/dev/null) \
+    || die "HestiaCP-API: ungültige Antwort"
+
+  # Aktuelle Domains als JSON: { "user": ["domain1", "domain2"], ... }
+  local current_json="{}"
+  while IFS= read -r huser; do
+    [[ -z "$huser" ]] && continue
+    local user_domains
+    user_domains=$(curl -sk -X POST "${HESTIA_API}" \
+      --data "${hestia_auth}&cmd=v-list-web-domains&arg1=${huser}&arg2=json" \
+      | jq -r 'keys[]' 2>/dev/null | jq -R . | jq -s .) || continue
+    current_json=$(echo "$current_json" \
+      | jq --arg u "$huser" --argjson d "$user_domains" '.[$u] = $d')
+  done <<< "$all_users"
+
+  local known_json
+  known_json=$(cat "$HESTIA_STATE")
+
+  # Neue Domains = in current aber nicht in known
+  local new_domains
+  new_domains=$(jq -rn     --argjson cur "$current_json"     --argjson known "$known_json"     '($cur | to_entries[]) as $e |
+     ($known[$e.key] // []) as $k |
+     ($e.value - $k)[] |
+     . + " " + $e.key')   # "domain user"
+
+  # Entfernte Domains = in known aber nicht in current
+  local removed_domains
+  removed_domains=$(jq -rn     --argjson cur "$current_json"     --argjson known "$known_json"     '($known | to_entries[]) as $e |
+     ($cur[$e.key] // []) as $c |
+     ($e.value - $c)[] |
+     . + " " + $e.key')   # "domain user"
+
+  local changed=0
+
+  # Neue Domains anlegen
+  if [[ -n "$new_domains" ]]; then
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      local domain huser
+      domain="${line%% *}"
+      huser="${line##* }"
+      log "Neue HestiaCP-Domain: ${domain} (User: ${huser})"
+      cmd_add_web "$domain"
+      changed=1
+    done <<< "$new_domains"
+  fi
+
+  # Entfernte Domains aufräumen
+  if [[ -n "$removed_domains" ]]; then
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      local domain huser
+      domain="${line%% *}"
+      huser="${line##* }"
+      log "Domain aus HestiaCP entfernt: ${domain} (User: ${huser})"
+      # Nur Traefik-Config entfernen, Zone bleibt (könnte noch Mail haben)
+      remove_traefik_config "$(safe_name "$domain")"
+      log "Traefik-Config fuer ${domain} entfernt (Zone bleibt erhalten)"
+      changed=1
+    done <<< "$removed_domains"
+  fi
+
+  if [[ $changed -eq 0 ]]; then
+    log "Keine Aenderungen in HestiaCP"
+  fi
+
+  # State aktualisieren
+  echo "$current_json" > "$HESTIA_STATE"
+  log "HestiaCP-Sync abgeschlossen"
+}
+
+
+### ═══════════════════════════════════════════════════════════════════════════
+### KOMMANDO: init-config
+### Erstellt eine kommentierte Beispiel-Konfigurationsdatei
+### ═══════════════════════════════════════════════════════════════════════════
+
+cmd_init_config() {
+  local target="${1:-/etc/dns-mgr/dns-mgr.conf}"
+  if [[ -f "$target" ]]; then
+    read -r -p "${target} existiert bereits. Ueberschreiben? [j/N] " confirm
+    [[ "$confirm" != "j" && "$confirm" != "J" ]] && { log "Abgebrochen"; exit 0; }
+  fi
+  mkdir -p "$(dirname "$target")"
+  chmod 700 "$(dirname "$target")"
+
+  cat > "$target" << 'CONF'
+# =============================================================================
+# dns-mgr Konfiguration
+# Ort:    /etc/dns-mgr/dns-mgr.conf
+# Rechte: chmod 600 (enthaelt API-Keys)
+# =============================================================================
+
+# ── PowerDNS (LXC 119) ───────────────────────────────────────────────────────
+PDNS_API="http://192.168.1.119:8081/api/v1"
+PDNS_KEY="DEIN-POWERDNS-API-KEY"
+
+# ── Traefik (lokal auf LXC 120) ──────────────────────────────────────────────
+TRAEFIK_CONF_DIR="/etc/traefik/conf.d"
+ACME_JSON="/var/lib/traefik/acme.json"
+ACME_RESOLVER="letsencrypt"
+
+# ── Mailcow (LXC 106) ────────────────────────────────────────────────────────
+MAILCOW_IP="192.168.1.106"
+MAILCOW_KEY="DEIN-MAILCOW-API-KEY"
+MAILCOW_IPV6="2a01:4f8:10b:f101::106"
+MAILCOW_CERT_DIR="/opt/mailcow-dockerized/data/assets/ssl"
+MAILCOW_COMPOSE_DIR="/opt/mailcow-dockerized"
+
+# ── HestiaCP (LXC 118) ───────────────────────────────────────────────────────
+# Access Key erstellen: v-add-access-key admin dns-mgr dns-mgr json
+HESTIA_IP="192.168.1.118"
+HESTIA_USER="admin"
+HESTIA_ACCESS_KEY="DEIN-ACCESS-KEY"
+HESTIA_SECRET_KEY="DEIN-SECRET-KEY"
+
+# ── Oeffentliche Adressen ─────────────────────────────────────────────────────
+PUBLIC_IPV4="DEINE-HETZNER-IPv4"
+IPV6_PREFIX="2a01:4f8:10b:f101"   # /64-Prefix OHNE :: am Ende
+
+# ── DNS / Nameserver ─────────────────────────────────────────────────────────
+MAIL_HOSTNAME="mail.DEINE-HAUPTDOMAIN.tld"
+SOA_HOSTMASTER="hostmaster.DEINE-HAUPTDOMAIN.tld."
+NS_RECORDS=(
+  "ns1.DEINE-HAUPTDOMAIN.tld."
+  "ns2.DEINE-HAUPTDOMAIN.tld."   # VPS Fremd-Hoster Secondary NS
+  "helium.ns.hetzner.de."
+  "oxygen.ns.hetzner.com."
+  "hydrogen.ns.hetzner.com."
+)
+
+# ── Zertifikat-Deployment-Targets ────────────────────────────────────────────
+# Jeder Eintrag: [name]="host:cert-pfad:key-pfad:reload-cmd:main-domain"
+#
+#   name        Frei waehlbarer Name (fuer --target <name>)
+#   host        SSH-Ziel IP. Leer lassen fuer lokales Deployment.
+#   cert-pfad   Vollstaendiger Pfad zur cert.pem auf dem Zielhost
+#   key-pfad    Vollstaendiger Pfad zur key.pem auf dem Zielhost
+#   reload-cmd  Shell-Kommando nach Update auf dem Zielhost. Leer = keines.
+#   main-domain Muss mit domain.main in acme.json uebereinstimmen
+#               (= erste Domain in der Traefik-Route)
+#
+# Mailcow: SAN-Cert fuer alle mail.* Subdomains aller Mail-Domains.
+# main-domain = erste mail.* Domain die mit add-mail angelegt wurde.
+declare -A CERT_TARGETS
+CERT_TARGETS=(
+  [mailcow]="192.168.1.106:/opt/mailcow-dockerized/data/assets/ssl/cert.pem:/opt/mailcow-dockerized/data/assets/ssl/key.pem:cd /opt/mailcow-dockerized && docker compose restart nginx-mailcow postfix-mailcow dovecot-mailcow:mail.DEINE-HAUPTDOMAIN.tld"
+
+  # Mumble-Beispiel:
+  # [mumble]="192.168.1.132:/etc/mumble-server/cert.pem:/etc/mumble-server/key.pem:systemctl restart mumble-server:mumble.DEINE-DOMAIN.tld"
+
+  # Lokales Deployment (z.B. SSHFS-Mount, kein SSH):
+  # [lokal]=":/lokaler/pfad/cert.pem:/lokaler/pfad/key.pem::app.DEINE-DOMAIN.tld"
+)
+
+# ── State-Verzeichnis ─────────────────────────────────────────────────────────
+# Hier speichert dns-mgr bekannte Domains (fuer hestia-sync, mailcow-sync)
+# und MTA-STS IDs. Normalerweise nicht aendern.
+STATE_DIR="/var/lib/dns-mgr"
+CONF
+
+  chmod 600 "$target"
+  log "Konfigurationsdatei erstellt: ${target}"
+  log "Bitte alle DEIN-* Platzhalter anpassen, dann:"
+  log "  chmod 600 ${target}"
+}
+
+### ═══════════════════════════════════════════════════════════════════════════
+### DISPATCHER
+### ═══════════════════════════════════════════════════════════════════════════
+
+case "${1:-help}" in
+  add-web)       shift; cmd_add_web "$@" ;;
+  add-mail)      shift; cmd_add_mail_records "$@" ;;
+  add-srv)       shift; cmd_add_srv "$@" ;;
+  add-service)   shift; cmd_add_service "$@" ;;
+  remove)        shift; cmd_remove "$@" ;;
+  mailcow-sync)  shift; cmd_mailcow_sync "$@" ;;
+  hestia-sync)   shift; cmd_hestia_sync "$@" ;;
+  deploy-certs)  shift; cmd_deploy_certs "$@" ;;
+  watch-certs)   shift; cmd_watch_certs "$@" ;;
+  cert-list)     cmd_cert_list ;;
+  list)          cmd_list ;;
+  init-config)   shift; cmd_init_config "${1:-}" ;;
+  help|--help|-h|*)
+    cat <<'HELP'
+dns-mgr — DNS · Traefik · Zertifikate
+
+DOMAIN-VERWALTUNG
+  add-web <domain> [--mail] [--ipv6=::XYZ]
+      Zone, A/AAAA-Records, Traefik-Route → HestiaCP
+      Subdomains werden in bestehende Zonen eingetragen
+      --mail: gleichzeitig Mail-Records anlegen
+
+  add-srv <zone> <service> <proto> <prio> <weight> <port> <target>
+      Generischer SRV-Record setzen
+      Beispiel: dns-mgr add-srv nfsmw15.de mumble tcp 0 10 64739 mumble.nfsmw15.de
+
+  add-mail <domain>
+      MX, SPF, DKIM, DMARC, MTA-STS, TLSRPT, SRV
+      Traefik: mail/webmail/autoconfig/autodiscover/mta-sts → Mailcow
+      Mailcow SAN-Zertifikat wird automatisch aktualisiert
+
+  add-service <domain> <backend-ip> <port> [optionen]
+      Beliebiger Dienst: DNS + Traefik
+      --type=tcp                TCP statt HTTP
+      --tcp-listen-port=<p>     Pflicht bei TCP
+      --ipv6=::CTID             IPv6 (Suffix, CTID oder volle Adresse)
+      --no-dns                  Nur Traefik, kein DNS
+      --no-ipv6                 Nur A-Record, kein AAAA (für interne Dienste)
+      --no-traefik              Nur DNS, keine Traefik-Route (Mumble, TS — direkt per NAT)
+      --insecure                Backend-Zertifikat nicht prüfen (pfSense, Proxmox etc.)
+      --subdomain-of=<zone>     Zone explizit angeben
+
+  remove <domain> [--force]
+      Zone + Traefik-Configs löschen
+
+  mailcow-sync
+      Mailcow-API pollen, neue Domains anlegen (fuer Cron)
+
+  hestia-sync
+      HestiaCP-API pollen, neue/entfernte Web-Domains synchronisieren
+      Erkennt neue Domains (add-web) und entfernte Domains (Traefik aufraeumen)
+      Empfohlen: jede Minute per Cron statt Hook-Scripts
+
+ZERTIFIKATE
+  deploy-certs [--target <n>] [--force]
+      Zertifikate aus acme.json deployen
+      Targets konfiguriert in CERT_TARGETS (oben im Script)
+
+  watch-certs [--settle=<sek>]
+      Dauerhaft: acme.json überwachen, bei Änderung deployen
+      Als systemd-Service: watch-cert.service
+
+  cert-list
+      Konfigurierte Targets + Zertifikate in acme.json
+
+ÜBERSICHT
+  list          Zonen, Traefik-Configs, Cert-Targets
+
+EINRICHTUNG
+  init-config [pfad]
+      Erstellt kommentierte Beispiel-Konfiguration
+      Standard: /etc/dns-mgr/dns-mgr.conf
+
+BEISPIELE
+  dns-mgr add-web example.com
+  dns-mgr add-web shop.example.com                        # Subdomain
+  dns-mgr add-web example.com --mail                      # Web + Mail
+  dns-mgr add-mail example.com                            # nur Mail
+  dns-mgr add-service cloud.example.com 192.168.1.130 80 --ipv6=::130
+  dns-mgr add-service ts.example.com 192.168.1.131 9987 --type=tcp --tcp-listen-port=9987
+  dns-mgr add-service ha.example.com 192.168.178.10 8123 --no-dns
+  dns-mgr deploy-certs                                    # alle Targets
+  dns-mgr deploy-certs --target mailcow --force
+  dns-mgr hestia-sync                             # manuell testen
+  dns-mgr hestia-sync                             # via Cron: * * * * *
+  dns-mgr watch-certs                                     # Watcher starten
+  dns-mgr init-config                                     # Ersteinrichtung
+  DNS_MGR_CONF=/andere/config.conf dns-mgr list           # andere Config
+HELP
+    ;;
+esac

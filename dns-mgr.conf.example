@@ -1,0 +1,93 @@
+# =============================================================================
+# dns-mgr Konfiguration
+# Ort:    /etc/dns-mgr/dns-mgr.conf
+# Rechte: chmod 600, chown root:root  (enthält API-Keys!)
+#
+# Einrichten:
+#   mkdir -p /etc/dns-mgr
+#   cp dns-mgr.conf /etc/dns-mgr/dns-mgr.conf
+#   chmod 700 /etc/dns-mgr
+#   chmod 600 /etc/dns-mgr/dns-mgr.conf
+#
+# Alternativ mit dns-mgr selbst generieren:
+#   dns-mgr init-config
+# =============================================================================
+
+# ── PowerDNS (LXC 119) ───────────────────────────────────────────────────────
+PDNS_API="http://192.168.1.119:8081/api/v1"
+PDNS_KEY="DEIN-POWERDNS-API-KEY"
+
+# ── Traefik (lokal auf LXC 120) ──────────────────────────────────────────────
+TRAEFIK_CONF_DIR="/etc/traefik/conf.d"
+ACME_JSON="/var/lib/traefik/acme.json"
+ACME_RESOLVER="letsencrypt"            # Name des certificatesResolver in traefik.yml
+
+# ── Mailcow (LXC 106) ────────────────────────────────────────────────────────
+MAILCOW_IP="192.168.1.106"
+MAILCOW_KEY="DEIN-MAILCOW-API-KEY"
+MAILCOW_IPV6="2a01:4f8:10b:f101::106"
+MAILCOW_CERT_DIR="/opt/mailcow-dockerized/data/assets/ssl"
+MAILCOW_COMPOSE_DIR="/opt/mailcow-dockerized"
+
+# ── HestiaCP (LXC 118) ───────────────────────────────────────────────────────
+# Access Key erstellen auf LXC 118:
+#   v-add-access-key admin dns-mgr dns-mgr json
+# IP 192.168.1.120 whitelisten:
+#   HestiaCP → Einstellungen → Sicherheit → Erlaubte IPs → 192.168.1.120
+HESTIA_IP="192.168.1.118"
+HESTIA_USER="admin"
+HESTIA_ACCESS_KEY="DEIN-ACCESS-KEY"
+HESTIA_SECRET_KEY="DEIN-SECRET-KEY"
+
+# ── Öffentliche Adressen ─────────────────────────────────────────────────────
+PUBLIC_IPV4="DEINE-HETZNER-IPv4"
+IPV6_PREFIX="2a01:4f8:10b:f101"        # /64-Prefix OHNE :: am Ende
+
+# ── DNS / Nameserver ─────────────────────────────────────────────────────────
+MAIL_HOSTNAME="mail.DEINE-HAUPTDOMAIN.tld"
+SOA_HOSTMASTER="hostmaster.DEINE-HAUPTDOMAIN.tld."
+NS_RECORDS=(
+  "ns1.DEINE-HAUPTDOMAIN.tld."
+  "ns2.DEINE-HAUPTDOMAIN.tld."         # VPS Fremd-Hoster Secondary NS
+  "helium.ns.hetzner.de."
+  "oxygen.ns.hetzner.com."
+  "hydrogen.ns.hetzner.com."
+)
+
+# ── Zertifikat-Deployment-Targets ────────────────────────────────────────────
+# Format: [name]="host:cert-pfad:key-pfad:reload-cmd:main-domain"
+#
+#   name        Frei wählbarer Name (für --target <n> bei deploy-certs)
+#   host        SSH-Ziel IP. Leer lassen für lokales Deployment (kein SSH).
+#   cert-pfad   Vollständiger Pfad zur cert.pem auf dem Zielhost
+#   key-pfad    Vollständiger Pfad zur key.pem auf dem Zielhost
+#   reload-cmd  Shell-Kommando nach Update auf dem Zielhost. Leer = keines.
+#   main-domain Muss mit domain.main in acme.json übereinstimmen
+#               (= erste Domain in der Traefik-Route, üblicherweise mail.*)
+#
+# Mailcow erhält ein SAN-Zertifikat das alle mail.* Subdomains aller
+# Mail-Domains enthält. main-domain = erste mail.* Domain die mit
+# add-mail angelegt wurde (steht auch in /etc/traefik/conf.d/mailcow-all.yml).
+#
+declare -A CERT_TARGETS
+CERT_TARGETS=(
+
+  # Mailcow — SAN-Zertifikat für alle Mail-Domains
+  [mailcow]="192.168.1.106:/opt/mailcow-dockerized/data/assets/ssl/cert.pem:/opt/mailcow-dockerized/data/assets/ssl/key.pem:cd /opt/mailcow-dockerized && docker compose restart nginx-mailcow postfix-mailcow dovecot-mailcow:mail.DEINE-HAUPTDOMAIN.tld"
+
+  # Mumble — eigenes Zertifikat
+  # [mumble]="192.168.1.132:/etc/mumble-server/cert.pem:/etc/mumble-server/key.pem:systemctl restart mumble-server:mumble.DEINE-DOMAIN.tld"
+
+  # Nextcloud — wenn eigenes TLS-Cert gewünscht (normalerweise nicht nötig,
+  # Traefik übernimmt das für HTTP-Dienste automatisch)
+  # [nextcloud]="192.168.1.130:/etc/ssl/nextcloud/cert.pem:/etc/ssl/nextcloud/key.pem:systemctl reload apache2:cloud.DEINE-DOMAIN.tld"
+
+  # Lokales Deployment ohne SSH (z.B. SSHFS-Mount):
+  # [lokal]=":/lokaler/pfad/cert.pem:/lokaler/pfad/key.pem::app.DEINE-DOMAIN.tld"
+)
+
+# ── State-Verzeichnis ─────────────────────────────────────────────────────────
+# Hier speichert dns-mgr bekannte Domains (für hestia-sync, mailcow-sync)
+# und MTA-STS IDs pro Domain (darf sich nur bei Policy-Änderung ändern).
+# Normalerweise nicht anpassen.
+STATE_DIR="/var/lib/dns-mgr"

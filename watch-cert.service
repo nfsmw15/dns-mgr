@@ -1,0 +1,37 @@
+# =============================================================================
+# /etc/systemd/system/watch-cert.service
+#
+# Überwacht Traefiks acme.json per inotify und deployt Zertifikate
+# an alle in /etc/dns-mgr/dns-mgr.conf konfigurierten CERT_TARGETS.
+#
+# Einrichten:
+#   install -m 644 watch-cert.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now watch-cert
+#   systemctl status watch-cert
+#   journalctl -u watch-cert -f
+# =============================================================================
+
+[Unit]
+Description=Traefik acme.json Watcher — Zertifikate an alle Targets deployen
+After=network-online.target traefik.service
+Wants=network-online.target
+BindsTo=traefik.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/dns-mgr watch-certs
+Restart=on-failure
+RestartSec=30s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dns-mgr-watch-cert
+
+# Sicherheitshärtung
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/traefik /var/lib/traefik /var/lib/dns-mgr /tmp
+ReadOnlyPaths=/root/.ssh /etc/dns-mgr
+
+[Install]
+WantedBy=multi-user.target
