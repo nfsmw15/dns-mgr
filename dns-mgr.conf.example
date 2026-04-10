@@ -76,7 +76,9 @@ CERT_TARGETS=(
   [mailcow]="192.168.1.106:/opt/mailcow-dockerized/data/assets/ssl/cert.pem:/opt/mailcow-dockerized/data/assets/ssl/key.pem:cd /opt/mailcow-dockerized && docker compose restart nginx-mailcow postfix-mailcow dovecot-mailcow:mail.DEINE-HAUPTDOMAIN.tld"
 
   # Mumble — eigenes Zertifikat
-  # [mumble]="192.168.1.132:/etc/mumble-server/cert.pem:/etc/mumble-server/key.pem:systemctl restart mumble-server:mumble.DEINE-DOMAIN.tld"
+  # Format: host:cert:key:reload_cmd:main_domain:owner:group:cert_mode:key_mode
+  # owner/group/cert_mode/key_mode sind optional — Standard: root:root:0644:0600
+  # [mumble]="192.168.1.123:/etc/mumble/certs/mumble.DEINE-DOMAIN.tld/fullchain.pem:/etc/mumble/certs/mumble.DEINE-DOMAIN.tld/privkey.pem:systemctl restart mumble-server:mumble.DEINE-DOMAIN.tld:root:mumble-server:0640:0640"
 
   # Nextcloud — wenn eigenes TLS-Cert gewünscht (normalerweise nicht nötig,
   # Traefik übernimmt das für HTTP-Dienste automatisch)
