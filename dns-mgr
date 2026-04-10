@@ -19,6 +19,7 @@
 # Ort:    /usr/local/bin/dns-mgr  (LXC 120 / Traefik)
 # Rechte: chmod 750, chown root:root
 #
+# Version: 0.2.0
 # Abhängigkeiten: curl, jq, openssl, inotifywait (inotify-tools), ssh, scp
 # =============================================================================
 set -euo pipefail
@@ -145,7 +146,7 @@ create_zone() {
     ns_json+="\"${ns}\""
   done
   pdns_post "/servers/localhost/zones" \
-    "{\"name\":\"${domain}.\",\"kind\":\"Native\",\"nameservers\":[${ns_json}]}" \
+    "{\"name\":\"${domain}.\",\"kind\":\"Master\",\"nameservers\":[${ns_json}]}" \
     || die "Zone ${domain} konnte nicht angelegt werden"
   set_record "$domain" "@" "SOA" \
     "${NS_RECORDS[0]} ${SOA_HOSTMASTER} $(date +%Y%m%d01) 3600 900 604800 300" 3600
@@ -575,7 +576,7 @@ cmd_add_mail_records() {
     "\"v=DMARC1; p=reject; rua=mailto:postmaster@${domain}; adkim=s; aspf=s\""
 
   local mta_sts_id; mta_sts_id=$(get_mta_sts_id "$domain")
-  set_record "$zone" "_mta-sts" "TXT" "\"v=STSv1; id=${mta_sts_id}\""
+  set_record "$zone" "_mta-sts" "TXT" "\"v=STSv1;id=${mta_sts_id};\""
 
   set_record "$zone" "_smtp._tls" "TXT" \
     "\"v=TLSRPTv1; rua=mailto:tlsrpt@${domain}\""
@@ -797,6 +798,62 @@ cmd_mailcow_sync() {
 }
 
 ### ═══════════════════════════════════════════════════════════════════════════
+### KOMMANDO: update-mta-sts
+### ═══════════════════════════════════════════════════════════════════════════
+
+cmd_update_mta_sts() {
+  log "MTA-STS IDs aus Mailcow-Datenbank aktualisieren"
+
+  # DB-Zugangsdaten von Mailcow-Host lesen
+  local dbpass
+  dbpass=$(ssh root@"${MAILCOW_IP}" \
+    "grep DBPASS /opt/mailcow-dockerized/mailcow.conf | cut -d= -f2") \
+    || die "SSH zu ${MAILCOW_IP} fehlgeschlagen"
+
+  # Alle MTA-STS Eintraege aus der DB lesen
+  local db_result
+  db_result=$(ssh root@"${MAILCOW_IP}" \
+    "docker compose -f /opt/mailcow-dockerized/docker-compose.yml exec -T mysql-mailcow \
+      mysql -u mailcow -p${dbpass} mailcow \
+      -sN -e 'SELECT domain, id FROM mta_sts WHERE active=1;' 2>/dev/null") \
+    || die "DB-Abfrage fehlgeschlagen"
+
+  local updated=0
+  while IFS=$'\t' read -r domain mta_sts_id; do
+    [[ -z "$domain" || "$domain" == "domain" ]] && continue
+
+    local zone="$domain"
+
+    # Aktuellen Record in PowerDNS lesen
+    local current
+    current=$(curl -s -H "X-API-Key: ${PDNS_KEY}" \
+      "${PDNS_API}/servers/localhost/zones/${zone}." \
+      | jq -r '.rrsets[] | select(.name == "_mta-sts.'"${zone}"'.") | .records[0].content' 2>/dev/null) || true
+
+    local expected="\"v=STSv1;id=${mta_sts_id};\""
+
+    if [[ "$current" == "$expected" ]]; then
+      info "${domain}: MTA-STS ID bereits korrekt (${mta_sts_id})"
+      continue
+    fi
+
+    log "${domain}: MTA-STS ID aktualisieren: ${mta_sts_id}"
+    set_record "$zone" "_mta-sts" "TXT" "\"v=STSv1;id=${mta_sts_id};\""
+
+    # State-Datei aktualisieren
+    mkdir -p "$STATE_DIR"
+    [[ -f "$MTA_STS_STATE" ]] || echo "{}" > "$MTA_STS_STATE"
+    local tmp; tmp=$(mktemp)
+    jq --arg d "$domain" --arg id "$mta_sts_id" '.[$d] = $id' "$MTA_STS_STATE" > "$tmp"
+    mv "$tmp" "$MTA_STS_STATE"
+
+    (( updated++ )) || true
+  done <<< "$db_result"
+
+  log "MTA-STS Update abgeschlossen — ${updated} Domain(s) aktualisiert"
+}
+
+
 ### KOMMANDO: deploy-certs
 ### ═══════════════════════════════════════════════════════════════════════════
 
@@ -1114,7 +1171,8 @@ case "${1:-help}" in
   add-srv)       shift; cmd_add_srv "$@" ;;
   add-service)   shift; cmd_add_service "$@" ;;
   remove)        shift; cmd_remove "$@" ;;
-  mailcow-sync)  shift; cmd_mailcow_sync "$@" ;;
+  mailcow-sync)    shift; cmd_mailcow_sync "$@" ;;
+  update-mta-sts) shift; cmd_update_mta_sts "$@" ;;
   hestia-sync)   shift; cmd_hestia_sync "$@" ;;
   deploy-certs)  shift; cmd_deploy_certs "$@" ;;
   watch-certs)   shift; cmd_watch_certs "$@" ;;
@@ -1156,6 +1214,9 @@ DOMAIN-VERWALTUNG
 
   mailcow-sync
       Mailcow-API pollen, neue Domains anlegen (fuer Cron)
+
+  update-mta-sts
+      MTA-STS IDs aus Mailcow API lesen und PowerDNS Records aktualisieren
 
   hestia-sync
       HestiaCP-API pollen, neue/entfernte Web-Domains synchronisieren
