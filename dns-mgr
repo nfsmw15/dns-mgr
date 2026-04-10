@@ -19,7 +19,7 @@
 # Ort:    /usr/local/bin/dns-mgr  (LXC 120 / Traefik)
 # Rechte: chmod 750, chown root:root
 #
-# Version: 0.2.0
+# Version: 0.3.0
 # Abhängigkeiten: curl, jq, openssl, inotifywait (inotify-tools), ssh, scp
 # =============================================================================
 set -euo pipefail
@@ -215,13 +215,23 @@ get_mta_sts_id() {
 ### ═══════════════════════════════════════════════════════════════════════════
 
 write_traefik_http() {
-  # write_traefik_http <service-name> <domain> [domain2 ...] -- <backend-url> [--insecure]
-  # --insecure: Backend-Zertifikat nicht prüfen (für selbstsignierte Certs wie pfSense, Proxmox)
+  # write_traefik_http <service-name> <domain> [domain2 ...] -- <backend-url> [optionen]
+  # --insecure:              Backend-Zertifikat nicht prüfen (pfSense, Proxmox etc.)
+  # --prefix=/pfad:          Pfad dem Request voranstellen (z.B. /phpmyadmin)
+  # --strip-prefix=/pfad:    Pfad aus dem Request entfernen bevor er ans Backend geht
+  # --basic-auth=user:hash:  HTTP Basic Authentication (Passwort als htpasswd-Hash)
+  # --redirect=https://ziel: URL-Weiterleitung
   local service_name="$1"; shift
   local domains=() backend_url="" sep=0 insecure=0
+  local prefix="" strip_prefix="" basic_auth="" redirect_url=""
+
   for arg in "$@"; do
-    if [[ "$arg" == "--" ]]; then sep=1; continue; fi
-    if [[ "$arg" == "--insecure" ]]; then insecure=1; continue; fi
+    if [[ "$arg" == "--" ]];             then sep=1; continue; fi
+    if [[ "$arg" == "--insecure" ]];     then insecure=1; continue; fi
+    if [[ "$arg" == --prefix=* ]];       then prefix="${arg#--prefix=}"; continue; fi
+    if [[ "$arg" == --strip-prefix=* ]]; then strip_prefix="${arg#--strip-prefix=}"; continue; fi
+    if [[ "$arg" == --basic-auth=* ]];   then basic_auth="${arg#--basic-auth=}"; continue; fi
+    if [[ "$arg" == --redirect=* ]];     then redirect_url="${arg#--redirect=}"; continue; fi
     [[ $sep -eq 0 ]] && domains+=("$arg") || backend_url="$arg"
   done
   [[ -z "$backend_url" ]] && die "write_traefik_http: Backend-URL fehlt"
@@ -231,11 +241,56 @@ write_traefik_http() {
     rule+=" || Host(\`${domains[$i]}\`)"
   done
 
-  # serversTransport nur bei --insecure
+  # Middlewares zusammenstellen
+  local middlewares="https-forward"
+  local middleware_block=""
+
   local transport_line=""
   [[ $insecure -eq 1 ]] && transport_line="        serversTransport: insecure"
 
-  log "Traefik HTTP: ${service_name} → ${backend_url}$([ $insecure -eq 1 ] && echo ' (insecure)')"
+  if [[ -n "$prefix" ]]; then
+    middlewares+=", ${service_name}-prefix"
+    middleware_block+="
+    ${service_name}-prefix:
+      addPrefix:
+        prefix: ${prefix}"
+  fi
+
+  if [[ -n "$strip_prefix" ]]; then
+    middlewares+=", ${service_name}-strip"
+    middleware_block+="
+    ${service_name}-strip:
+      stripPrefix:
+        prefixes:
+          - ${strip_prefix}"
+  fi
+
+  if [[ -n "$basic_auth" ]]; then
+    middlewares+=", ${service_name}-auth"
+    middleware_block+="
+    ${service_name}-auth:
+      basicAuth:
+        users:
+          - \"${basic_auth}\""
+  fi
+
+  if [[ -n "$redirect_url" ]]; then
+    middlewares+=", ${service_name}-redirect"
+    middleware_block+="
+    ${service_name}-redirect:
+      redirectRegex:
+        regex: \".*\"
+        replacement: \"${redirect_url}\""
+  fi
+
+  local middlewares_yaml="[${middlewares}]"
+  local middlewares_section=""
+  if [[ -n "$middleware_block" ]]; then
+    middlewares_section="  middlewares:${middleware_block}"
+  fi
+
+  log "Traefik HTTP: ${service_name} → ${backend_url}$([ $insecure -eq 1 ] && echo ' (insecure)')$([ -n "$prefix" ] && echo " (prefix: ${prefix})")$([ -n "$strip_prefix" ] && echo " (strip: ${strip_prefix})")$([ -n "$basic_auth" ] && echo ' (basic-auth)')$([ -n "$redirect_url" ] && echo " (redirect: ${redirect_url})")"
+
   cat > "${TRAEFIK_CONF_DIR}/${service_name}.yml" <<EOF
 http:
   routers:
@@ -244,8 +299,9 @@ http:
       entryPoints: [websecure]
       tls:
         certResolver: ${ACME_RESOLVER}
-      middlewares: [https-forward]
+      middlewares: ${middlewares_yaml}
       service: ${service_name}
+${middlewares_section}
   services:
     ${service_name}:
       loadBalancer:
@@ -413,8 +469,12 @@ cert_deploy_target() {
   [[ -z "$cfg" ]] && die "Unbekanntes Target '${target_name}'. Verfügbar: ${!CERT_TARGETS[*]}"
 
   # Felder aus Konfig-String parsen (:-getrennt)
+  # Format: host:cert:key:reload_cmd:main_domain[:owner:group:cert_mode:key_mode]
   local host remote_cert remote_key reload_cmd main_domain
-  IFS=':' read -r host remote_cert remote_key reload_cmd main_domain <<< "$cfg"
+  local remote_owner="" remote_group="" cert_mode="0644" key_mode="0600"
+  IFS=':' read -r host remote_cert remote_key reload_cmd main_domain remote_owner remote_group cert_mode_cfg key_mode_cfg <<< "$cfg"
+  [[ -n "${cert_mode_cfg:-}" ]] && cert_mode="$cert_mode_cfg"
+  [[ -n "${key_mode_cfg:-}"  ]] && key_mode="$key_mode_cfg"
 
   log "=== Cert-Target: ${target_name} (${main_domain}) ==="
 
@@ -431,16 +491,18 @@ cert_deploy_target() {
     scp -F /dev/null -q "${tmp_dir}/key.pem"  "root@${host}:${remote_key}.new"
 
     local result
-    result=$(ssh -F /dev/null "root@${host}" \
-      REMOTE_CERT="$remote_cert" REMOTE_KEY="$remote_key" FORCE="$force" \
-      bash <<'REMOTE'
+    result=$(ssh -F /dev/null "root@${host}"       REMOTE_CERT="$remote_cert" REMOTE_KEY="$remote_key" FORCE="$force"       REMOTE_OWNER="$remote_owner" REMOTE_GROUP="$remote_group"       CERT_MODE="$cert_mode" KEY_MODE="$key_mode"       bash <<'REMOTE'
 set -euo pipefail
 changed=0
 if ! cmp -s "${REMOTE_CERT}.new" "${REMOTE_CERT}" 2>/dev/null; then
-  install -m 0644 "${REMOTE_CERT}.new" "${REMOTE_CERT}"; changed=1
+  install -m "${CERT_MODE}" "${REMOTE_CERT}.new" "${REMOTE_CERT}"; changed=1
 fi
 if ! cmp -s "${REMOTE_KEY}.new" "${REMOTE_KEY}" 2>/dev/null; then
-  install -m 0600 "${REMOTE_KEY}.new" "${REMOTE_KEY}"; changed=1
+  install -m "${KEY_MODE}" "${REMOTE_KEY}.new" "${REMOTE_KEY}"; changed=1
+fi
+# Eigentümer setzen falls angegeben
+if [[ -n "${REMOTE_OWNER}" || -n "${REMOTE_GROUP}" ]]; then
+  chown "${REMOTE_OWNER}:${REMOTE_GROUP}" "${REMOTE_CERT}" "${REMOTE_KEY}" 2>/dev/null || true
 fi
 rm -f "${REMOTE_CERT}.new" "${REMOTE_KEY}.new"
 [[ "$changed" -eq 1 || "$FORCE" -eq 1 ]] && echo "updated" || echo "unchanged"
@@ -608,6 +670,8 @@ cmd_add_mail_records() {
 cmd_add_service() {
   local domain="" backend_ip="" backend_port=""
   local type="http" tcp_listen_port="" custom_ipv6="" no_dns=0 no_ipv6=0 insecure=0 no_traefik=0 explicit_zone=""
+  local prefix="" strip_prefix="" basic_auth="" redirect_url="" internal=0
+  local extra_paths=()  # Array von "pfad:ip:port[:insecure]"
 
   for arg in "$@"; do
     case "$arg" in
@@ -618,7 +682,13 @@ cmd_add_service() {
       --no-ipv6)           no_ipv6=1 ;;
       --no-traefik)        no_traefik=1 ;;
       --insecure)          insecure=1 ;;
+      --internal)          internal=1; no_traefik=1 ;;
       --subdomain-of=*)    explicit_zone="${arg#--subdomain-of=}" ;;
+      --prefix=*)          prefix="${arg#--prefix=}" ;;
+      --strip-prefix=*)    strip_prefix="${arg#--strip-prefix=}" ;;
+      --basic-auth=*)      basic_auth="${arg#--basic-auth=}" ;;
+      --redirect=*)        redirect_url="${arg#--redirect=}" ;;
+      --extra-path=*)      extra_paths+=("${arg#--extra-path=}") ;;
       *)
         if   [[ -z "$domain"       ]]; then domain="$arg"
         elif [[ -z "$backend_ip"   ]]; then backend_ip="$arg"
@@ -645,19 +715,23 @@ cmd_add_service() {
 
   local svc_name; svc_name=$(safe_name "$domain")
 
+  # Bei --internal: DNS zeigt auf interne Backend-IP statt PUBLIC_IPV4
+  local dns_ipv4="$PUBLIC_IPV4"
+  [[ $internal -eq 1 ]] && dns_ipv4="$backend_ip"
+
   if [[ $no_dns -eq 0 ]]; then
     local zone="${explicit_zone:-$(get_zone_for_domain "$domain")}"
     if [[ -z "$zone" ]]; then
       create_zone "$domain"; set_ns_records "$domain"; zone="$domain"
-      set_record "$zone" "@" "A" "$PUBLIC_IPV4"
-      [[ $no_ipv6 -eq 0 ]] && set_record "$zone" "@" "AAAA" "$target_ipv6"
+      set_record "$zone" "@" "A" "$dns_ipv4"
+      [[ $no_ipv6 -eq 0 && $internal -eq 0 ]] && set_record "$zone" "@" "AAAA" "$target_ipv6"
     elif [[ "$zone" == "$domain" ]]; then
-      set_record "$zone" "@" "A" "$PUBLIC_IPV4"
-      [[ $no_ipv6 -eq 0 ]] && set_record "$zone" "@" "AAAA" "$target_ipv6"
+      set_record "$zone" "@" "A" "$dns_ipv4"
+      [[ $no_ipv6 -eq 0 && $internal -eq 0 ]] && set_record "$zone" "@" "AAAA" "$target_ipv6"
     else
       local sub="${domain%.${zone}}"
-      set_record "$zone" "$sub" "A" "$PUBLIC_IPV4"
-      [[ $no_ipv6 -eq 0 ]] && set_record "$zone" "$sub" "AAAA" "$target_ipv6"
+      set_record "$zone" "$sub" "A" "$dns_ipv4"
+      [[ $no_ipv6 -eq 0 && $internal -eq 0 ]] && set_record "$zone" "$sub" "AAAA" "$target_ipv6"
     fi
   fi
 
@@ -672,13 +746,53 @@ cmd_add_service() {
   else
     local backend_url="http://${backend_ip}:${backend_port}"
     [[ $insecure -eq 1 ]] && backend_url="https://${backend_ip}:${backend_port}"
-    write_traefik_http "$svc_name" "$domain" -- "$backend_url" $insecure_flag
+    local extra_flags=""
+    [[ -n "$prefix"       ]] && extra_flags+=" --prefix=${prefix}"
+    [[ -n "$strip_prefix" ]] && extra_flags+=" --strip-prefix=${strip_prefix}"
+    [[ -n "$basic_auth"   ]] && extra_flags+=" --basic-auth=${basic_auth}"
+    [[ -n "$redirect_url" ]] && extra_flags+=" --redirect=${redirect_url}"
+    write_traefik_http "$svc_name" "$domain" -- "$backend_url" $insecure_flag $extra_flags
+  fi
+
+  # --extra-path: zusätzliche Pfade mit separatem Backend zur bestehenden Route hinzufügen
+  # Format: --extra-path=/pfad:ip:port[:insecure]
+  # Beispiel: --extra-path=/phpmyadmin:192.168.1.118:80
+  if [[ ${#extra_paths[@]} -gt 0 ]]; then
+    local yml_file="${TRAEFIK_CONF_DIR}/${svc_name}.yml"
+    for ep in "${extra_paths[@]}"; do
+      local ep_path ep_ip ep_port ep_insecure=0
+      IFS=: read -r ep_path ep_ip ep_port ep_ins <<< "$ep"
+      [[ "${ep_ins:-}" == "insecure" ]] && ep_insecure=1
+      local ep_name="${svc_name}-$(echo "${ep_path//\//-}" | tr -d '-' | head -c 20)"
+      local ep_url="http://${ep_ip}:${ep_port}"
+      [[ $ep_insecure -eq 1 ]] && ep_url="https://${ep_ip}:${ep_port}"
+      local ep_transport=""
+      [[ $ep_insecure -eq 1 ]] && ep_transport="
+        serversTransport: insecure"
+
+      log "Extra-Pfad: ${domain}${ep_path} → ${ep_url}"
+      cat >> "$yml_file" <<EOF
+
+    ${ep_name}:
+      rule: "Host(\`${domain}\`) && PathPrefix(\`${ep_path}\`)"
+      entryPoints: [websecure]
+      tls:
+        certResolver: ${ACME_RESOLVER}
+      service: ${ep_name}
+  services:
+    ${ep_name}:
+      loadBalancer:
+        servers:
+          - url: "${ep_url}"${ep_transport}
+EOF
+    done
   fi
 
   local ipv6_info="${target_ipv6}"
-  [[ $no_ipv6 -eq 1 ]] && ipv6_info="(kein AAAA)"
+  [[ $no_ipv6 -eq 1 || $internal -eq 1 ]] && ipv6_info="(intern: ${backend_ip})"
   local traefik_info=""
-  [[ $no_traefik -eq 1 ]] && traefik_info=" (kein Traefik — direkt per NAT)"
+  [[ $no_traefik -eq 1 && $internal -eq 0 ]] && traefik_info=" (kein Traefik — direkt per NAT)"
+  [[ $internal -eq 1 ]] && traefik_info=" (intern — nur über VPN erreichbar)"
   log "Dienst ${domain} eingerichtet (${type}) → ${backend_ip}:${backend_port} | IPv6: ${ipv6_info}${traefik_info}"
 }
 
@@ -727,6 +841,11 @@ cmd_remove() {
   local domain="${1:-}" force=0
   [[ "${2:-}" == "--force" ]] && force=1
   [[ -z "$domain" ]] && die "remove: Domain fehlt"
+
+  # URL bereinigen — http(s):// und trailing / entfernen
+  domain="${domain#https://}"
+  domain="${domain#http://}"
+  domain="${domain%/}"
 
   if [[ $force -eq 0 ]]; then
     read -r -p "Zone ${domain} und Traefik-Config löschen? [j/N] " confirm
@@ -1208,6 +1327,10 @@ DOMAIN-VERWALTUNG
       --no-traefik              Nur DNS, keine Traefik-Route (Mumble, TS — direkt per NAT)
       --insecure                Backend-Zertifikat nicht prüfen (pfSense, Proxmox etc.)
       --subdomain-of=<zone>     Zone explizit angeben
+      --prefix=/pfad            Pfad dem Request voranstellen (z.B. /phpmyadmin)
+      --strip-prefix=/pfad      Pfad aus dem Request entfernen bevor er ans Backend geht
+      --basic-auth=user:hash    HTTP Basic Authentication (Hash via: htpasswd -nb user pw)
+      --redirect=https://ziel   URL-Weiterleitung
 
   remove <domain> [--force]
       Zone + Traefik-Configs löschen
@@ -1251,6 +1374,11 @@ BEISPIELE
   dns-mgr add-service cloud.example.com 192.168.1.130 80 --ipv6=::130
   dns-mgr add-service ts.example.com 192.168.1.131 9987 --type=tcp --tcp-listen-port=9987
   dns-mgr add-service ha.example.com 192.168.178.10 8123 --no-dns
+  dns-mgr add-service phpmyadmin.example.com 192.168.1.118 80 --prefix=/phpmyadmin
+  dns-mgr add-service intern.example.com 192.168.1.100 80 --basic-auth=admin:'$apr1$xyz...'
+  dns-mgr add-service old.example.com 192.168.1.100 80 --redirect=https://new.example.com
+  dns-mgr add-service drucker.example.com 192.168.1.50 631 --internal
+  dns-mgr add-service cp.example.com 192.168.1.118 8083 --insecure --extra-path=/phpmyadmin:192.168.1.118:80
   dns-mgr deploy-certs                                    # alle Targets
   dns-mgr deploy-certs --target mailcow --force
   dns-mgr hestia-sync                             # manuell testen
