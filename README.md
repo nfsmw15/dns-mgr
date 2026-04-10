@@ -159,6 +159,9 @@ dns-mgr add-mail example.com
 dns-mgr add-service subdomain.example.com 192.168.1.100 8080 --ipv6=::100
 dns-mgr add-service admin.example.com 192.168.1.1 443 --ipv6=::120 --insecure
 dns-mgr add-service mumble.example.com 192.168.1.123 64738 --ipv6=::123 --no-traefik
+dns-mgr add-service phpmyadmin.example.com 192.168.1.118 80 --prefix=/phpmyadmin
+dns-mgr add-service intern.example.com 192.168.1.100 80 --basic-auth="admin:$(htpasswd -nb admin passwort | cut -d: -f2)"
+dns-mgr add-service old.example.com 192.168.1.100 80 --redirect=https://new.example.com
 
 # SRV-Record setzen:
 dns-mgr add-srv example.com mumble tcp 0 10 64738 mumble.example.com
@@ -176,6 +179,9 @@ dns-mgr hestia-sync
 
 # Mailcow-Domains prüfen:
 dns-mgr mailcow-sync
+
+# MTA-STS IDs aus Mailcow-Datenbank synchronisieren:
+dns-mgr update-mta-sts
 ```
 
 ### Zertifikate
@@ -214,20 +220,29 @@ dns-mgr list
 | `--type=tcp` | TCP statt HTTP |
 | `--tcp-listen-port=N` | Pflicht bei TCP |
 | `--subdomain-of=zone` | Zone explizit angeben |
+| `--prefix=/pfad` | Pfad dem Request voranstellen (z.B. `/phpmyadmin`) |
+| `--strip-prefix=/pfad` | Pfad aus dem Request entfernen bevor er ans Backend geht |
+| `--basic-auth=user:hash` | HTTP Basic Authentication vorschalten (Hash via `htpasswd -nb user pw`) |
+| `--redirect=https://ziel` | URL-Weiterleitung zur Ziel-URL |
+| `--internal` | DNS zeigt auf interne Backend-IP — kein Traefik, nur über VPN erreichbar |
+| `--extra-path=/pfad:ip:port[:insecure]` | Zusätzlichen Pfad mit separatem Backend zur Route hinzufügen |
 
 ---
 
 ## Zertifikat-Deployment (CERT_TARGETS)
 
-Format: `[name]="host:cert-pfad:key-pfad:reload-cmd:main-domain"`
+Format: `[name]="host:cert-pfad:key-pfad:reload-cmd:main-domain[:owner:group:cert-mode:key-mode]"`
+
+Die letzten vier Felder `owner`, `group`, `cert-mode` und `key-mode` sind optional.
+Standard: `root:root:0644:0600`
 
 ```bash
 CERT_TARGETS=(
   # Mailcow
   [mailcow]="192.168.1.106:/opt/mailcow/data/assets/ssl/cert.pem:/opt/mailcow/data/assets/ssl/key.pem:cd /opt/mailcow && docker compose restart nginx-mailcow:mail.example.com"
 
-  # Mumble
-  [mumble]="192.168.1.123:/etc/mumble/cert.pem:/etc/mumble/key.pem:systemctl restart mumble-server:mumble.example.com"
+  # Mumble — mit korrektem Owner und Rechten damit mumble-server die Datei lesen kann
+  [mumble]="192.168.1.123:/etc/mumble/certs/mumble.example.com/fullchain.pem:/etc/mumble/certs/mumble.example.com/privkey.pem:systemctl restart mumble-server:mumble.example.com:root:mumble-server:0640:0640"
 
   # Lokales Deployment (kein SSH):
   [lokal]=":/pfad/cert.pem:/pfad/key.pem::subdomain.example.com"
