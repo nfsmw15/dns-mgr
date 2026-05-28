@@ -42,6 +42,7 @@ HESTIA_SECRET_KEY="DEIN-SECRET-KEY"
 # ── Öffentliche Adressen ─────────────────────────────────────────────────────
 PUBLIC_IPV4="DEINE-HETZNER-IPv4"
 IPV6_PREFIX="2a01:4f8:10b:f101"        # /64-Prefix OHNE :: am Ende
+TRAEFIK_IPV6=""                         # IPv6 der Traefik-LXC — leer = IPV6_PREFIX::120
 
 # ── DNS / Nameserver ─────────────────────────────────────────────────────────
 MAIL_HOSTNAME="mail.DEINE-HAUPTDOMAIN.tld"

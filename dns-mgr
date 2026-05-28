@@ -48,6 +48,7 @@ HESTIA_ACCESS_KEY=""
 HESTIA_SECRET_KEY=""
 PUBLIC_IPV4=""
 IPV6_PREFIX=""
+TRAEFIK_IPV6=""
 MAIL_HOSTNAME=""
 SOA_HOSTMASTER=""
 NS_RECORDS=()
@@ -82,6 +83,7 @@ fi
 # Abgeleitete Variablen (nach Config-Load, damit IPs gesetzt sind)
 MAILCOW_API="https://${MAILCOW_IP}/api/v1"
 HESTIA_API="https://${HESTIA_IP}:8083/api/"
+[[ -z "${TRAEFIK_IPV6:-}" && -n "${IPV6_PREFIX:-}" ]] && TRAEFIK_IPV6="${IPV6_PREFIX}::120"
 
 # State-Dateien
 MAILCOW_STATE="${STATE_DIR}/mailcow-domains.json"
@@ -674,7 +676,7 @@ echo \$deleted?'deleted':'notfound';"
 
 cmd_add_web() {
   local domain="" with_mail=0
-  local backend_ipv6; backend_ipv6=$(ipv6_addr "::118")
+  local backend_ipv6="${TRAEFIK_IPV6}"
 
   for arg in "$@"; do
     case "$arg" in
