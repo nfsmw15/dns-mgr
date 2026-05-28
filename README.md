@@ -17,6 +17,7 @@ Wenn du eine Domain in HestiaCP anlegst passiert automatisch:
 - Bei Mail-Domains: MX, SPF, DKIM, DMARC, MTA-STS, TLSRPT, SRV werden gesetzt
 - Mailcow SAN-Zertifikat wird automatisch aktualisiert
 - Zertifikate werden automatisch an Mailcow und andere Dienste deployt
+- *(optional)* pfSense Unbound Host Override wird gesetzt → Split-DNS
 
 Kein manueller Eingriff nötig.
 
@@ -137,6 +138,16 @@ declare -A CERT_TARGETS
 CERT_TARGETS=(
   [mailcow]="192.168.1.106:/opt/mailcow/.../cert.pem:/opt/mailcow/.../key.pem:docker compose restart ...:mail.DEINE-DOMAIN.tld"
 )
+
+# pfSense Split-DNS (optional)
+PFSENSE_HOST="192.168.1.1"
+PFSENSE_USER="admin"
+PFSENSE_PASS="dein-passwort"
+
+# HSTS (optional)
+HSTS_MAX_AGE="31536000"   # nach Testphase mit 300 starten
+HSTS_SUBDOMAINS=0
+HSTS_PRELOAD=0
 ```
 
 ---
@@ -182,6 +193,12 @@ dns-mgr mailcow-sync
 
 # MTA-STS IDs aus Mailcow-Datenbank synchronisieren:
 dns-mgr update-mta-sts
+
+# Split-DNS: alle Traefik-Configs mit pfSense Unbound abgleichen:
+dns-mgr sync-split-dns
+
+# Split-DNS: aktuelle Unbound Host Overrides anzeigen:
+dns-mgr list-split-dns
 ```
 
 ### Zertifikate
@@ -205,6 +222,145 @@ dns-mgr watch-certs
 ```bash
 dns-mgr list
 ```
+
+---
+
+## Split-DNS (pfSense Unbound)
+
+Domains wie `pve.nfsmw15.de` zeigen extern auf die öffentliche IP — intern sollen LAN-Clients direkt zur Backend-IP auflösen, ohne NAT-Loopback. dns-mgr setzt automatisch Unbound Host Overrides in pfSense.
+
+### Voraussetzung
+
+Kein zusätzliches Paket nötig — nutzt das eingebaute XML-RPC von pfSense CE. Funktioniert mit Standard-Admin-Zugangsdaten.
+
+### Konfiguration
+
+```bash
+# In /etc/dns-mgr/dns-mgr.conf ergänzen:
+PFSENSE_HOST="192.168.1.1"
+PFSENSE_USER="admin"
+PFSENSE_PASS="dein-passwort"
+```
+
+Wenn `PFSENSE_HOST` leer bleibt, wird Split-DNS bei allen Befehlen stillschweigend übersprungen — das Feature ist vollständig optional.
+
+### Verwendung
+
+```bash
+# Automatisch bei add-service / add-web:
+dns-mgr add-service pve.nfsmw15.de 192.168.1.50 8006 --insecure
+# → setzt PowerDNS A-Record auf PUBLIC_IPV4
+# → setzt Traefik-Route
+# → setzt pfSense Unbound Override: pve.nfsmw15.de → 192.168.1.50
+
+# Bestehende Dienste nachträglich synchronisieren:
+dns-mgr sync-split-dns
+
+# Alle aktuellen Overrides anzeigen:
+dns-mgr list-split-dns
+
+# Beim Entfernen wird der Override automatisch gelöscht:
+dns-mgr remove pve.nfsmw15.de
+```
+
+### Wie es funktioniert
+
+| Client | DNS-Auflösung | Ergebnis |
+|--------|--------------|---------|
+| Extern (Internet) | Öffentlicher DNS | PUBLIC_IPV4 → Traefik → Backend |
+| Intern (LAN) | pfSense Unbound | 192.168.1.50 → Backend direkt |
+
+---
+
+## HSTS
+
+HTTP Strict Transport Security — Browser merken sich dass eine Domain immer nur über HTTPS erreichbar ist und überspringen den HTTP-Schritt komplett.
+
+### Voraussetzung
+
+Alle Domains müssen HTTPS-ready sein. Prüfen mit:
+
+```bash
+cat > /tmp/check-https.sh << 'EOF'
+grep -rhoP "Host\(\`\K[^\`]+" /etc/traefik/conf.d/*.yml 2>/dev/null \
+| sort -u \
+| while read -r domain; do
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+      -H "Host: ${domain}" "http://127.0.0.1/" 2>/dev/null)
+    redirect=$(curl -s -o /dev/null -w "%{redirect_url}" --max-time 5 \
+      -H "Host: ${domain}" "http://127.0.0.1/" 2>/dev/null)
+    if [[ "$redirect" == https://* ]]; then
+      printf "OK   %-45s  HTTP %s -> HTTPS\n" "$domain" "$http_code"
+    else
+      printf "!!   %-45s  HTTP %s - kein HTTPS-Redirect\n" "$domain" "$http_code"
+    fi
+  done
+EOF
+bash /tmp/check-https.sh
+```
+
+### Aktivieren
+
+```bash
+# In /etc/dns-mgr/dns-mgr.conf:
+HSTS_MAX_AGE="300"      # 5 Minuten zum Testen
+HSTS_SUBDOMAINS=0
+HSTS_PRELOAD=0          # Nicht aktivieren — quasi unwiderruflich
+
+# HSTS in alle Traefik-Routen eintragen:
+dns-mgr enable-hsts
+
+# Nach ein paar Tagen auf 1 Jahr erhöhen:
+# HSTS_MAX_AGE="31536000"
+# dns-mgr enable-hsts
+
+# Notausstieg:
+dns-mgr disable-hsts
+```
+
+### Hinweis zu includeSubDomains
+
+`HSTS_SUBDOMAINS=1` bedeutet: ein Browser der `example.com` besucht, erzwingt HTTPS danach auch für alle Subdomains ohne sie besucht zu haben. Nur aktivieren wenn **alle** Subdomains zuverlässig HTTPS haben.
+
+---
+
+## Real-IP (X-Forwarded-For)
+
+Einmalige Infrastruktur-Konfiguration — nicht Teil des dns-mgr Scripts.
+
+**Problem:** PHP und nginx-Logs sehen `REMOTE_ADDR = Traefik-IP` statt der echten Client-IP. AWStats und andere Log-Auswertungen zeigen dadurch nur eine einzige IP.
+
+### Traefik (`/etc/traefik/traefik.yml`)
+
+Verhindert dass Clients `X-Forwarded-For` fälschen können:
+
+```yaml
+entryPoints:
+  web:
+    address: ":80"
+    forwardedHeaders:
+      trustedIPs: ["127.0.0.1/32", "::1/128"]
+  websecure:
+    address: ":443"
+    forwardedHeaders:
+      trustedIPs: ["127.0.0.1/32", "::1/128"]
+```
+
+### HestiaCP nginx (`/etc/nginx/conf.d/cloudflare.inc`)
+
+Traefik als vertrauenswürdigen Proxy eintragen und `X-Forwarded-For` als Real-IP Header nutzen:
+
+```nginx
+# Traefik (lokaler Reverse Proxy)
+set_real_ip_from 192.168.1.120/32;
+
+# ... weitere set_real_ip_from Einträge ...
+
+real_ip_header    X-Forwarded-For;
+real_ip_recursive on;
+```
+
+Nach `systemctl reload nginx` sehen PHP und die nginx Access Logs die echte Client-IP.
 
 ---
 

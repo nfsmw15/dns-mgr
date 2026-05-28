@@ -5,6 +5,26 @@ Alle wichtigen Änderungen an dns-mgr werden in dieser Datei dokumentiert.
 Das Format basiert auf [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 das Projekt folgt [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-05-28
+
+### Hinzugefügt
+- **Split-DNS über pfSense Unbound** (optional): Beim Anlegen eines Dienstes mit `add-web` oder `add-service` wird automatisch ein Unbound Host Override in pfSense gesetzt, sodass LAN-Clients die Domain direkt zur internen Backend-IP auflösen — ohne NAT-Loopback.
+- Neuer Befehl `sync-split-dns`: Liest alle bestehenden Traefik-Configs aus `TRAEFIK_CONF_DIR` und gleicht die Unbound Host Overrides in pfSense vollständig ab (hinzufügen, aktualisieren, veraltete entfernen). Ideal um bestehende Dienste nachzurüsten.
+- Neuer Befehl `list-split-dns`: Zeigt alle aktuellen Unbound Host Overrides in pfSense tabellarisch an.
+- Drei neue Config-Variablen: `PFSENSE_HOST`, `PFSENSE_USER`, `PFSENSE_PASS` — das Feature wird stillschweigend übersprungen wenn `PFSENSE_HOST` leer ist, kein Pflichtfeld.
+- `remove` löscht den zugehörigen pfSense Host Override automatisch mit.
+- **HSTS (HTTP Strict Transport Security)**: Neuer Befehl `enable-hsts` schreibt eine gemeinsame Traefik-Middleware und trägt sie in alle bestehenden Routen ein. Neuer Befehl `disable-hsts` als Notausstieg.
+- Drei neue Config-Variablen: `HSTS_MAX_AGE`, `HSTS_SUBDOMAINS`, `HSTS_PRELOAD` — leer = deaktiviert.
+- Neuer Befehl `check-https` (als Skript): Prüft alle Traefik-Domains ob HTTP korrekt auf HTTPS weiterleitet — Voraussetzung vor HSTS-Aktivierung.
+
+### Technisch
+- Split-DNS nutzt das eingebaute XML-RPC von pfSense CE (`/xmlrpc.php`) — kein zusätzliches Paket nötig. Authentifizierung über Admin-User und Passwort.
+- HSTS unterstützt beide Traefik YAML-Formate (inline `[middleware]` und Listenformat `- middleware`).
+
+### Infrastruktur-Setup (einmalig, nicht im Script)
+- **Traefik** (`traefik.yml`): `forwardedHeaders.trustedIPs` auf Localhost gesetzt — verhindert dass Clients `X-Forwarded-For` Headers fälschen können.
+- **HestiaCP nginx** (`/etc/nginx/conf.d/cloudflare.inc`): Traefik-IP als vertrauenswürdiger Proxy eingetragen, `real_ip_header` auf `X-Forwarded-For` umgestellt. PHP und nginx-Logs sehen ab sofort die echte Client-IP statt der Traefik-IP — AWStats und andere Log-Auswertungen funktionieren wieder korrekt.
+
 ## [0.3.0] - 2026-04-10
 
 ### Hinzugefügt

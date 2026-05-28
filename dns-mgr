@@ -19,7 +19,7 @@
 # Ort:    /usr/local/bin/dns-mgr  (LXC 120 / Traefik)
 # Rechte: chmod 750, chown root:root
 #
-# Version: 0.3.0
+# Version: 0.4.0
 # Abhängigkeiten: curl, jq, openssl, inotifywait (inotify-tools), ssh, scp
 # =============================================================================
 set -euo pipefail
@@ -52,6 +52,20 @@ MAIL_HOSTNAME=""
 SOA_HOSTMASTER=""
 NS_RECORDS=()
 declare -A CERT_TARGETS=()
+
+# ── pfSense Split-DNS (optional) ──────────────────────────────────────────────
+# Kein zusätzliches Paket nötig — nutzt das eingebaute XML-RPC von pfSense CE.
+PFSENSE_HOST=""
+PFSENSE_USER=""
+PFSENSE_PASS=""
+
+# ── HSTS (optional) ───────────────────────────────────────────────────────────
+# Leer lassen = HSTS deaktiviert.
+# Zum Testen mit 300 (5 Min) starten, nach Prüfung auf 31536000 (1 Jahr) erhöhen.
+HSTS_MAX_AGE=""
+HSTS_SUBDOMAINS=0   # 1 = includeSubDomains (nur wenn ALLE Subdomains HTTPS haben)
+HSTS_PRELOAD=0      # 1 = Preload-List Eintrag (VORSICHT: quasi unwiderruflich)
+
 STATE_DIR="/var/lib/dns-mgr"
 
 # Config laden
@@ -243,6 +257,7 @@ write_traefik_http() {
 
   # Middlewares zusammenstellen
   local middlewares="https-forward"
+  [[ -n "${HSTS_MAX_AGE:-}" ]] && middlewares+=", hsts"
   local middleware_block=""
 
   local transport_line=""
@@ -373,6 +388,23 @@ remove_traefik_config() {
   for f in "${TRAEFIK_CONF_DIR}/${1}.yml" "${TRAEFIK_CONF_DIR}/${1}-tcp.yml"; do
     [[ -f "$f" ]] && rm -f "$f" && log "Traefik-Config gelöscht: ${f}"
   done
+}
+
+write_hsts_middleware() {
+  [[ -z "${HSTS_MAX_AGE:-}" ]] && return 0
+  local subs="false" preload="false"
+  [[ "${HSTS_SUBDOMAINS:-0}" -eq 1 ]] && subs="true"
+  [[ "${HSTS_PRELOAD:-0}"    -eq 1 ]] && preload="true"
+  cat > "${TRAEFIK_CONF_DIR}/hsts.yml" <<EOF
+http:
+  middlewares:
+    hsts:
+      headers:
+        stsSeconds: ${HSTS_MAX_AGE}
+        stsIncludeSubdomains: ${subs}
+        stsPreload: ${preload}
+        forceSTSHeader: true
+EOF
 }
 
 # Mailcow SAN-Zertifikat-Route aus allen vorhandenen mail-*.yml neu aufbauen
@@ -538,6 +570,105 @@ REMOTE
 }
 
 ### ═══════════════════════════════════════════════════════════════════════════
+### PFSENSE SPLIT-DNS (Unbound Host Overrides via XML-RPC)
+###
+### Kein Paket nötig — nutzt das eingebaute XML-RPC von pfSense CE.
+### Zugangsdaten: normaler pfSense Admin-User + Passwort.
+### ═══════════════════════════════════════════════════════════════════════════
+
+pfsense_configured() {
+  [[ -n "${PFSENSE_HOST:-}" && -n "${PFSENSE_USER:-}" && -n "${PFSENSE_PASS:-}" ]]
+}
+
+pfsense_exec_php() {
+  # Führt PHP-Code auf pfSense via XML-RPC (pfsense.exec_php) aus.
+  # Gibt die vom PHP-Code per echo ausgegebene Zeichenkette zurück.
+  local php_code="$1"
+  local result
+  result=$(curl -sf -k -X POST \
+    -H "Content-Type: text/xml" \
+    --data-binary @- \
+    "https://${PFSENSE_HOST}/xmlrpc.php" 2>/dev/null <<XMLEOF
+<?xml version='1.0' encoding='utf-8'?>
+<methodCall>
+  <methodName>pfsense.exec_php</methodName>
+  <params>
+    <param><value><string><![CDATA[${PFSENSE_USER}]]></string></value></param>
+    <param><value><string><![CDATA[${PFSENSE_PASS}]]></string></value></param>
+    <param><value><string><![CDATA[${php_code}]]></string></value></param>
+  </params>
+</methodCall>
+XMLEOF
+  ) || return 1
+  # Ausgabe aus XML-RPC Antwort extrahieren
+  echo "$result" | grep -oP '(?<=<string>)[^<]+'
+}
+
+pfsense_set_override() {
+  # pfsense_set_override <fqdn> <zone> <ip>
+  local fqdn="$1" zone="$2" ip="$3"
+  pfsense_configured || return 0
+
+  local host_part domain_part
+  [[ "$fqdn" == "$zone" ]] && host_part="" || host_part="${fqdn%.${zone}}"
+  domain_part="$zone"
+
+  local php_code="require_once('unbound.inc');
+\$h='${host_part}'; \$d='${domain_part}'; \$ip='${ip}'; \$desc='dns-mgr: ${fqdn}';
+if(!is_array(\$config['unbound']['hosts'])){\$config['unbound']['hosts']=array();}
+\$found=false;
+foreach(\$config['unbound']['hosts'] as \$k=>\$hh){
+  if(\$hh['host']===\$h&&\$hh['domain']===\$d){\$config['unbound']['hosts'][\$k]['ip']=\$ip;\$found=true;break;}
+}
+if(!\$found){\$config['unbound']['hosts'][]=array('host'=>\$h,'domain'=>\$d,'ip'=>\$ip,'descr'=>\$desc,'aliases'=>array());}
+write_config('dns-mgr');
+services_unbound_configure(false);
+echo 'ok';"
+
+  local result
+  result=$(pfsense_exec_php "$php_code") || {
+    warn "pfSense nicht erreichbar — Split-DNS für ${fqdn} übersprungen"
+    return 0
+  }
+  [[ "$result" == "ok" ]] \
+    && info "pfSense Split-DNS: ${fqdn} → ${ip}" \
+    || warn "pfSense Split-DNS: Override für ${fqdn} fehlgeschlagen (Antwort: ${result:-leer})"
+}
+
+pfsense_delete_override() {
+  # pfsense_delete_override <fqdn> <zone>
+  local fqdn="$1" zone="$2"
+  pfsense_configured || return 0
+
+  local host_part domain_part
+  [[ "$fqdn" == "$zone" ]] && host_part="" || host_part="${fqdn%.${zone}}"
+  domain_part="$zone"
+
+  local php_code="require_once('unbound.inc');
+\$h='${host_part}'; \$d='${domain_part}';
+\$deleted=false;
+if(is_array(\$config['unbound']['hosts'])){
+  foreach(\$config['unbound']['hosts'] as \$k=>\$hh){
+    if(\$hh['host']===\$h&&\$hh['domain']===\$d){unset(\$config['unbound']['hosts'][\$k]);\$deleted=true;}
+  }
+  \$config['unbound']['hosts']=array_values(\$config['unbound']['hosts']);
+}
+if(\$deleted){write_config('dns-mgr');services_unbound_configure(false);}
+echo \$deleted?'deleted':'notfound';"
+
+  local result
+  result=$(pfsense_exec_php "$php_code") || {
+    warn "pfSense nicht erreichbar — Split-DNS für ${fqdn} nicht gelöscht"
+    return 0
+  }
+  case "$result" in
+    deleted)  info "pfSense Split-DNS: ${fqdn} gelöscht" ;;
+    notfound) info "pfSense Split-DNS: Kein Override für ${fqdn} gefunden" ;;
+    *)        warn "pfSense Split-DNS: ${fqdn} löschen fehlgeschlagen" ;;
+  esac
+}
+
+### ═══════════════════════════════════════════════════════════════════════════
 ### KOMMANDO: add-web
 ### ═══════════════════════════════════════════════════════════════════════════
 
@@ -580,6 +711,8 @@ cmd_add_web() {
 
   write_traefik_http "$(safe_name "$domain")" \
     "$domain" "www.${domain}" -- "http://${HESTIA_IP}:80"
+
+  pfsense_set_override "$domain" "$zone" "$HESTIA_IP"
 
   [[ $with_mail -eq 1 ]] && cmd_add_mail_records "$domain"
   log "Web-Domain ${domain} eingerichtet"
@@ -788,6 +921,10 @@ EOF
     done
   fi
 
+  if pfsense_configured && [[ $no_dns -eq 0 && $internal -eq 0 ]]; then
+    pfsense_set_override "$domain" "${zone:-$domain}" "$backend_ip"
+  fi
+
   local ipv6_info="${target_ipv6}"
   [[ $no_ipv6 -eq 1 || $internal -eq 1 ]] && ipv6_info="(intern: ${backend_ip})"
   local traefik_info=""
@@ -850,6 +987,13 @@ cmd_remove() {
   if [[ $force -eq 0 ]]; then
     read -r -p "Zone ${domain} und Traefik-Config löschen? [j/N] " confirm
     [[ "$confirm" != "j" && "$confirm" != "J" ]] && { log "Abgebrochen"; exit 0; }
+  fi
+
+  # Split-DNS Override vor Zone-Löschung entfernen (Zone wird noch für Lookup benötigt)
+  if pfsense_configured; then
+    local rm_zone; rm_zone=$(get_zone_for_domain "$domain")
+    [[ -z "$rm_zone" ]] && rm_zone="$domain"
+    pfsense_delete_override "$domain" "$rm_zone"
   fi
 
   if zone_exists "$domain"; then
@@ -1268,6 +1412,26 @@ CERT_TARGETS=(
   # [lokal]=":/lokaler/pfad/cert.pem:/lokaler/pfad/key.pem::app.DEINE-DOMAIN.tld"
 )
 
+# ── pfSense Split-DNS (optional) ─────────────────────────────────────────────
+# Ermoeglicht automatisches Setzen von Unbound Host Overrides in pfSense,
+# damit interne Clients Domains direkt zur LAN-IP aufloesen (kein NAT-Loopback).
+#
+# Kein Paket noetig — nutzt das eingebaute XML-RPC von pfSense CE.
+# Zugangsdaten: normaler pfSense Admin-User und Passwort.
+#
+# Wenn PFSENSE_HOST leer bleibt, wird Split-DNS einfach uebersprungen.
+PFSENSE_HOST=""           # z.B. 192.168.1.1
+PFSENSE_USER=""           # pfSense Admin-Benutzername (z.B. admin)
+PFSENSE_PASS=""           # pfSense Admin-Passwort
+
+# ── HSTS (optional) ───────────────────────────────────────────────────────────
+# Leer lassen = HSTS deaktiviert.
+# Ablauf: erst 300 (5 Min) setzen + dns-mgr enable-hsts ausfuehren + testen,
+# dann auf 31536000 (1 Jahr) erhoehen + erneut enable-hsts.
+HSTS_MAX_AGE=""           # Sekunden (300 = Test, 31536000 = Produktion)
+HSTS_SUBDOMAINS=0         # 1 = includeSubDomains
+HSTS_PRELOAD=0            # 1 = Preload (VORSICHT: quasi unwiderruflich)
+
 # ── State-Verzeichnis ─────────────────────────────────────────────────────────
 # Hier speichert dns-mgr bekannte Domains (fuer hestia-sync, mailcow-sync)
 # und MTA-STS IDs. Normalerweise nicht aendern.
@@ -1278,6 +1442,227 @@ CONF
   log "Konfigurationsdatei erstellt: ${target}"
   log "Bitte alle DEIN-* Platzhalter anpassen, dann:"
   log "  chmod 600 ${target}"
+}
+
+### ═══════════════════════════════════════════════════════════════════════════
+### KOMMANDO: enable-hsts / disable-hsts
+### ═══════════════════════════════════════════════════════════════════════════
+
+cmd_enable_hsts() {
+  [[ -z "${HSTS_MAX_AGE:-}" ]] && \
+    die "HSTS_MAX_AGE nicht gesetzt — in dns-mgr.conf setzen (z.B. HSTS_MAX_AGE=300)"
+
+  write_hsts_middleware
+  log "HSTS-Middleware geschrieben: ${TRAEFIK_CONF_DIR}/hsts.yml (max-age=${HSTS_MAX_AGE})"
+
+  local patched=0 skipped=0
+  for yml in "${TRAEFIK_CONF_DIR}"/*.yml; do
+    [[ -f "$yml" ]] || continue
+    [[ "$(basename "$yml")" == "hsts.yml" ]] && continue
+    if grep -q '\bhsts\b' "$yml"; then
+      (( skipped++ )) || true
+      continue
+    fi
+    local changed=0
+    # Format 1: middlewares: [xxx]
+    if grep -q 'middlewares: \[' "$yml"; then
+      sed -i 's/middlewares: \[/middlewares: [hsts, /' "$yml"
+      changed=1
+    fi
+    # Format 2: middlewares:\n  - xxx
+    if grep -qP '^\s+middlewares:\s*$' "$yml"; then
+      perl -i -0pe 's/([ \t]+middlewares:\n)([ \t]+- )(?!hsts)/$1$2hsts\n$2/g' "$yml"
+      changed=1
+    fi
+    [[ $changed -eq 1 ]] && (( patched++ )) || true
+  done
+
+  log "HSTS aktiviert — ${patched} Configs aktualisiert, ${skipped} bereits vorhanden"
+  log "Browser cached HSTS für ${HSTS_MAX_AGE} Sekunden ab erstem HTTPS-Aufruf"
+  if [[ "${HSTS_MAX_AGE}" -ge 86400 ]] 2>/dev/null; then
+    warn "max-age >= 1 Tag — teste vorher mit einem Browser ob alles erreichbar ist"
+  fi
+}
+
+cmd_disable_hsts() {
+  local removed=0
+
+  [[ -f "${TRAEFIK_CONF_DIR}/hsts.yml" ]] && \
+    rm -f "${TRAEFIK_CONF_DIR}/hsts.yml" && log "hsts.yml gelöscht"
+
+  for yml in "${TRAEFIK_CONF_DIR}"/*.yml; do
+    [[ -f "$yml" ]] || continue
+    if grep -q '\bhsts\b' "$yml"; then
+      # Format 1: [hsts, xxx] oder [xxx, hsts]
+      sed -i 's/middlewares: \[hsts, /middlewares: [/' "$yml"
+      sed -i 's/, hsts\]/]/' "$yml"
+      # Format 2: - hsts Zeile entfernen
+      sed -i '/^[[:space:]]*- hsts[[:space:]]*$/d' "$yml"
+      (( removed++ )) || true
+    fi
+  done
+
+  log "HSTS deaktiviert — ${removed} Configs bereinigt"
+  [[ -n "${HSTS_MAX_AGE:-}" ]] && \
+    warn "Browser behalten HSTS noch bis zu ${HSTS_MAX_AGE}s (Cache läuft ab)"
+}
+
+### ═══════════════════════════════════════════════════════════════════════════
+### KOMMANDO: sync-split-dns
+### Liest alle Traefik-Configs und gleicht Unbound Host Overrides in pfSense ab
+### ═══════════════════════════════════════════════════════════════════════════
+
+cmd_sync_split_dns() {
+  pfsense_configured \
+    || die "Split-DNS nicht konfiguriert — PFSENSE_HOST, PFSENSE_USER, PFSENSE_PASS in dns-mgr.conf setzen"
+
+  log "Split-DNS Sync: lese Traefik-Configs aus ${TRAEFIK_CONF_DIR}"
+
+  # Gewünschte Overrides aus Traefik-Configs: "host_part|domain_part" → "ip"
+  local -A desired=()
+
+  for yml in "${TRAEFIK_CONF_DIR}"/*.yml; do
+    [[ -f "$yml" ]] || continue
+    local backend_ip
+    backend_ip=$(grep -oP 'url: "?\K[^"]+' "$yml" 2>/dev/null \
+      | head -1 | grep -oP '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    [[ -z "$backend_ip" ]] && continue
+    while IFS= read -r fqdn; do
+      [[ -z "$fqdn" ]] && continue
+      local zone; zone=$(get_zone_for_domain "$fqdn")
+      if [[ -z "$zone" ]]; then
+        local -a fparts; IFS='.' read -ra fparts <<< "$fqdn"
+        local fn=${#fparts[@]}
+        [[ $fn -ge 2 ]] && zone="${fparts[$((fn-2))]}.${fparts[$((fn-1))]}" || zone="$fqdn"
+      fi
+      local h d
+      [[ "$fqdn" == "$zone" ]] && h="" || h="${fqdn%.${zone}}"
+      d="$zone"
+      desired["${h}|${d}"]="$backend_ip"
+    done < <(grep -oP "Host\(\`\K[^\`]+" "$yml" 2>/dev/null || true)
+  done
+
+  log "Domains in Traefik-Configs: ${#desired[@]}"
+
+  # Bestehende pfSense Overrides einmalig laden
+  local list_php="\$out=array();
+if(is_array(\$config['unbound']['hosts'])){
+  foreach(\$config['unbound']['hosts'] as \$k=>\$h){
+    \$out[]=array('id'=>\$k,'host'=>isset(\$h['host'])?\$h['host']:'','domain'=>isset(\$h['domain'])?\$h['domain']:'','ip'=>isset(\$h['ip'])?\$h['ip']:'','descr'=>isset(\$h['descr'])?\$h['descr']:'');
+  }
+}
+echo json_encode(\$out);"
+
+  local existing_json
+  existing_json=$(pfsense_exec_php "$list_php") \
+    || die "pfSense nicht erreichbar — Zugangsdaten prüfen"
+  [[ -z "$existing_json" || "$existing_json" == "null" ]] && \
+    die "pfSense XML-RPC: keine Antwort — PFSENSE_USER/PFSENSE_PASS prüfen"
+
+  local updated=0 unchanged=0 removed=0
+
+  # Gewünschte Overrides setzen / aktualisieren
+  for key in "${!desired[@]}"; do
+    local h="${key%%|*}" d="${key##*|}" ip="${desired[$key]}"
+    local existing_ip
+    existing_ip=$(echo "$existing_json" \
+      | jq -r --arg h "$h" --arg d "$d" \
+        '.[] | select(.host == $h and .domain == $d) | .ip' 2>/dev/null | head -1)
+
+    if [[ "$existing_ip" == "$ip" ]]; then
+      info "Unverändert: ${h:+$h.}${d} → ${ip}"
+      (( unchanged++ )) || true
+      continue
+    fi
+
+    local set_php="require_once('unbound.inc');
+\$h='${h}'; \$d='${d}'; \$ip='${ip}'; \$desc='dns-mgr: ${h:+$h.}${d}';
+if(!is_array(\$config['unbound']['hosts'])){\$config['unbound']['hosts']=array();}
+\$found=false;
+foreach(\$config['unbound']['hosts'] as \$k=>\$hh){
+  if(\$hh['host']===\$h&&\$hh['domain']===\$d){\$config['unbound']['hosts'][\$k]['ip']=\$ip;\$found=true;break;}
+}
+if(!\$found){\$config['unbound']['hosts'][]=array('host'=>\$h,'domain'=>\$d,'ip'=>\$ip,'descr'=>\$desc,'aliases'=>array());}
+write_config('dns-mgr');
+echo 'ok';"
+
+    local result
+    if result=$(pfsense_exec_php "$set_php" 2>/dev/null) && [[ "$result" == "ok" ]]; then
+      log "Gesetzt: ${h:+$h.}${d} → ${ip}"
+      (( updated++ )) || true
+    else
+      warn "Fehlgeschlagen: ${h:+$h.}${d}"
+    fi
+  done
+
+  # Von dns-mgr angelegte, nun veraltete Overrides entfernen
+  while IFS=$'\t' read -r oh od; do
+    [[ -z "$oh" && -z "$od" ]] && continue
+    local key="${oh}|${od}"
+    if [[ -z "${desired[$key]+x}" ]]; then
+      local del_php="require_once('unbound.inc');
+\$h='${oh}'; \$d='${od}';
+\$deleted=false;
+if(is_array(\$config['unbound']['hosts'])){
+  foreach(\$config['unbound']['hosts'] as \$k=>\$hh){
+    if(\$hh['host']===\$h&&\$hh['domain']===\$d){unset(\$config['unbound']['hosts'][\$k]);\$deleted=true;}
+  }
+  \$config['unbound']['hosts']=array_values(\$config['unbound']['hosts']);
+}
+if(\$deleted){write_config('dns-mgr');}
+echo \$deleted?'deleted':'notfound';"
+      local result
+      if result=$(pfsense_exec_php "$del_php" 2>/dev/null) && [[ "$result" == "deleted" ]]; then
+        log "Veraltet entfernt: ${oh:+$oh.}${od}"
+        (( removed++ )) || true
+      fi
+    fi
+  done < <(echo "$existing_json" \
+    | jq -r '.[] | select(.descr | startswith("dns-mgr:")) | [.host, .domain] | @tsv' \
+    2>/dev/null || true)
+
+  # Einmaliger Unbound-Reload nach allen Änderungen
+  if [[ $((updated + removed)) -gt 0 ]]; then
+    local reload_php="require_once('unbound.inc'); services_unbound_configure(false); echo 'ok';"
+    pfsense_exec_php "$reload_php" >/dev/null 2>&1 \
+      || warn "Unbound Reload fehlgeschlagen (nicht kritisch)"
+  fi
+
+  log "Split-DNS Sync abgeschlossen — ${updated} aktualisiert, ${unchanged} unverändert, ${removed} entfernt"
+}
+
+### ═══════════════════════════════════════════════════════════════════════════
+### KOMMANDO: list-split-dns
+### Zeigt alle Unbound Host Overrides in pfSense
+### ═══════════════════════════════════════════════════════════════════════════
+
+cmd_list_split_dns() {
+  pfsense_configured \
+    || die "Split-DNS nicht konfiguriert — PFSENSE_HOST, PFSENSE_USER, PFSENSE_PASS in dns-mgr.conf setzen"
+
+  local list_php="\$out=array();
+if(is_array(\$config['unbound']['hosts'])){
+  foreach(\$config['unbound']['hosts'] as \$k=>\$h){
+    \$out[]=array('host'=>isset(\$h['host'])?\$h['host']:'','domain'=>isset(\$h['domain'])?\$h['domain']:'','ip'=>isset(\$h['ip'])?\$h['ip']:'','descr'=>isset(\$h['descr'])?\$h['descr']:'');
+  }
+}
+echo json_encode(\$out);"
+
+  local json
+  json=$(pfsense_exec_php "$list_php") || die "pfSense nicht erreichbar"
+  [[ -z "$json" || "$json" == "null" ]] && die "pfSense XML-RPC: keine Antwort — Zugangsdaten prüfen"
+
+  local count
+  count=$(echo "$json" | jq 'length' 2>/dev/null || echo "0")
+
+  echo ""
+  echo "pfSense Unbound Host Overrides (${count} gesamt):"
+  printf "  %-40s  %-15s  %s\n" "DOMAIN" "IP" "BESCHREIBUNG"
+  printf "  %-40s  %-15s  %s\n" "------" "--" "------------"
+  echo "$json" | jq -r '.[] | "\(.host)|\(.domain)|\(.ip)|\(.descr)"' 2>/dev/null \
+    | while IFS='|' read -r h d ip descr; do
+        printf "  %-40s  %-15s  %s\n" "${h:+$h.}${d}" "$ip" "$descr"
+      done
 }
 
 ### ═══════════════════════════════════════════════════════════════════════════
@@ -1293,11 +1678,15 @@ case "${1:-help}" in
   mailcow-sync)    shift; cmd_mailcow_sync "$@" ;;
   update-mta-sts) shift; cmd_update_mta_sts "$@" ;;
   hestia-sync)   shift; cmd_hestia_sync "$@" ;;
-  deploy-certs)  shift; cmd_deploy_certs "$@" ;;
-  watch-certs)   shift; cmd_watch_certs "$@" ;;
-  cert-list)     cmd_cert_list ;;
-  list)          cmd_list ;;
-  init-config)   shift; cmd_init_config "${1:-}" ;;
+  deploy-certs)    shift; cmd_deploy_certs "$@" ;;
+  watch-certs)     shift; cmd_watch_certs "$@" ;;
+  cert-list)       cmd_cert_list ;;
+  list)            cmd_list ;;
+  enable-hsts)     cmd_enable_hsts ;;
+  disable-hsts)    cmd_disable_hsts ;;
+  sync-split-dns)  shift; cmd_sync_split_dns "$@" ;;
+  list-split-dns)  cmd_list_split_dns ;;
+  init-config)     shift; cmd_init_config "${1:-}" ;;
   help|--help|-h|*)
     cat <<'HELP'
 dns-mgr — DNS · Traefik · Zertifikate
@@ -1357,6 +1746,28 @@ ZERTIFIKATE
 
   cert-list
       Konfigurierte Targets + Zertifikate in acme.json
+
+HSTS
+  enable-hsts
+      Schreibt die HSTS-Middleware (hsts.yml) und trägt sie in alle
+      bestehenden Traefik-Configs ein.
+      Voraussetzung: HSTS_MAX_AGE in dns-mgr.conf gesetzt
+      Empfehlung: erst mit HSTS_MAX_AGE=300 testen, dann auf 31536000 erhöhen
+
+  disable-hsts
+      Notausstieg — entfernt HSTS aus allen Traefik-Configs sofort.
+      Browser behalten den Cache noch bis max-age Sekunden.
+
+SPLIT-DNS (pfSense Unbound)
+  sync-split-dns
+      Liest alle Traefik-Configs aus TRAEFIK_CONF_DIR und gleicht
+      die Unbound Host Overrides in pfSense ab.
+      Fügt fehlende Overrides hinzu, aktualisiert geänderte IPs,
+      entfernt von dns-mgr angelegte Overrides ohne Traefik-Gegenstück.
+      Erfordert: PFSENSE_HOST, PFSENSE_USER, PFSENSE_PASS in dns-mgr.conf
+
+  list-split-dns
+      Zeigt alle aktuellen Unbound Host Overrides in pfSense
 
 ÜBERSICHT
   list          Zonen, Traefik-Configs, Cert-Targets

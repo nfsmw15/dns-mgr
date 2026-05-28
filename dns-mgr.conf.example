@@ -88,6 +88,35 @@ CERT_TARGETS=(
   # [lokal]=":/lokaler/pfad/cert.pem:/lokaler/pfad/key.pem::app.DEINE-DOMAIN.tld"
 )
 
+# ── pfSense Split-DNS (optional) ─────────────────────────────────────────────
+# Ermöglicht automatisches Setzen von Unbound Host Overrides in pfSense:
+# Domains wie pve.nfsmw15.de zeigen extern auf die öffentliche IP,
+# intern lösen sie direkt zur LAN-IP auf — kein NAT-Loopback nötig.
+#
+# Kein Paket nötig — nutzt das eingebaute XML-RPC von pfSense CE.
+# Zugangsdaten: normaler pfSense Admin-User und Passwort.
+#
+# Wenn PFSENSE_HOST leer bleibt, wird Split-DNS bei jedem Befehl
+# stillschweigend übersprungen — kein Fehler, kein Pflichtfeld.
+PFSENSE_HOST=""           # z.B. 192.168.1.1
+PFSENSE_USER=""           # pfSense Admin-Benutzername (z.B. admin)
+PFSENSE_PASS=""           # pfSense Admin-Passwort
+
+# ── HSTS (optional) ───────────────────────────────────────────────────────────
+# Aktivieren: HSTS_MAX_AGE setzen, dann: dns-mgr enable-hsts
+# Deaktivieren (Notausstieg): dns-mgr disable-hsts
+#
+# Empfohlener Ablauf:
+#   1. HSTS_MAX_AGE=300 setzen (5 Minuten — Browser cached kurz)
+#   2. dns-mgr enable-hsts
+#   3. Browser-Test: alle Domains erreichbar?
+#   4. HSTS_MAX_AGE=31536000 setzen (1 Jahr)
+#   5. dns-mgr enable-hsts (aktualisiert hsts.yml)
+#
+HSTS_MAX_AGE=""           # leer = HSTS deaktiviert
+HSTS_SUBDOMAINS=0         # 1 = includeSubDomains (nur wenn ALLE Subdomains HTTPS)
+HSTS_PRELOAD=0            # 1 = Preload-List (VORSICHT: quasi unwiderruflich)
+
 # ── State-Verzeichnis ─────────────────────────────────────────────────────────
 # Hier speichert dns-mgr bekannte Domains (für hestia-sync, mailcow-sync)
 # und MTA-STS IDs pro Domain (darf sich nur bei Policy-Änderung ändern).
