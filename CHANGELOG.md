@@ -5,6 +5,11 @@ Alle wichtigen Änderungen an dns-mgr werden in dieser Datei dokumentiert.
 Das Format basiert auf [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 das Projekt folgt [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-06-20
+
+### Behoben
+- `cert_deploy_target`: Mailcow legt für SNI-Verbindungen pro Domain einen eigenen Zertifikatspfad an (`data/assets/ssl/<domain>/cert.pem`), der unabhängig vom global per `CERT_TARGETS` deployten `cert.pem`/`key.pem` ist und von Dovecot/Postfix bei einer SNI-Verbindung bevorzugt wird. Dieser Pfad wurde bisher nie aktualisiert, wodurch Mailcow live ein nie erneuertes, irgendwann abgelaufenes Zertifikat auslieferte — unabhängig davon, wie aktuell der global deployte Cert war. Nach jedem Deploy wird jetzt automatisch ein Symlink von `<main_domain>/cert.pem` bzw. `key.pem` auf den globalen Cert/Key gesetzt, falls dieses Verzeichnis auf dem Zielhost existiert.
+
 ## [0.4.2] - 2026-06-20
 
 ### Behoben
