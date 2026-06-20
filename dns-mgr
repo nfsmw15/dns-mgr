@@ -1161,11 +1161,21 @@ cmd_watch_certs() {
 
   log "Überwache ${ACME_JSON} (settle: ${settle}s) ..."
 
-  inotifywait -m -e close_write --format '%f' "$(dirname "$ACME_JSON")" \
+  # ACME-Clients (Traefik/lego) schreiben acme.json atomar: zuerst wird eine
+  # Temp-Datei geschrieben (löst close_write auf den Temp-Dateinamen aus),
+  # anschließend per rename() auf den finalen Dateinamen verschoben (löst
+  # moved_to aus, NICHT close_write). Ohne moved_to in der Event-Liste wird
+  # dieses entscheidende Event nie empfangen und watch-certs reagiert nie auf
+  # neue Zertifikate — close_write allein reicht hier nicht aus.
+  inotifywait -m -e close_write,moved_to --format '%f' "$(dirname "$ACME_JSON")" \
   | while IFS= read -r filename; do
       [[ "$filename" != "$(basename "$ACME_JSON")" ]] && continue
       log "acme.json geändert — warte ${settle}s ..."
       sleep "$settle"
+      # Während der Settle-Zeit angesammelte Folge-Events (z.B. wenn sowohl
+      # close_write als auch moved_to auf den finalen Dateinamen passen)
+      # verwerfen, damit nicht mehrfach hintereinander deployed wird.
+      while read -r -t 0.1 _; do :; done
       log "Starte deploy-certs ..."
       if cmd_deploy_certs; then
         log "deploy-certs erfolgreich"

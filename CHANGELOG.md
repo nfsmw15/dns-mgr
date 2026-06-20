@@ -5,6 +5,11 @@ Alle wichtigen Änderungen an dns-mgr werden in dieser Datei dokumentiert.
 Das Format basiert auf [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 das Projekt folgt [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-06-20
+
+### Behoben
+- `watch-certs`: `moved_to`-Event ergänzt — Traefik/lego schreibt `acme.json` atomar (Temp-Datei schreiben, dann `rename()` auf den finalen Namen). Der Watcher horchte bisher nur auf `close_write`, das ausschließlich auf den Temp-Dateinamen feuert und vom Filter verworfen wird. Dadurch wurde das eigentlich relevante Event nie empfangen und neue Zertifikate nie automatisch deployt.
+
 ## [0.4.0] - 2026-05-28
 
 ### Hinzugefügt
