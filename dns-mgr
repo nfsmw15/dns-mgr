@@ -521,11 +521,18 @@ cert_deploy_target() {
   if [[ -n "$host" ]]; then
     # ── SSH-Deployment ─────────────────────────────────────────────────────
     info "Übertrage nach ${host} ..."
-    scp -F /dev/null -q "${tmp_dir}/cert.pem" "root@${host}:${remote_cert}.new"
-    scp -F /dev/null -q "${tmp_dir}/key.pem"  "root@${host}:${remote_key}.new"
+    # scp/ssh-Fehlschläge (z.B. Host nicht erreichbar) explizit prüfen —
+    # sonst würde dank set -e-Sonderregel innerhalb von if-Bedingungen ein
+    # fehlgeschlagener Transfer hier sonst stillschweigend als "unverändert"
+    # durchgehen, statt als Fehler gemeldet zu werden.
+    if ! scp -F /dev/null -q "${tmp_dir}/cert.pem" "root@${host}:${remote_cert}.new" \
+        || ! scp -F /dev/null -q "${tmp_dir}/key.pem"  "root@${host}:${remote_key}.new"; then
+      warn "Übertragung nach ${host} fehlgeschlagen — Target übersprungen"
+      return 1
+    fi
 
     local result
-    result=$(ssh -F /dev/null "root@${host}"       REMOTE_CERT="$remote_cert" REMOTE_KEY="$remote_key" FORCE="$force"       REMOTE_OWNER="$remote_owner" REMOTE_GROUP="$remote_group"       CERT_MODE="$cert_mode" KEY_MODE="$key_mode"       bash <<'REMOTE'
+    if ! result=$(ssh -F /dev/null "root@${host}"       REMOTE_CERT="$remote_cert" REMOTE_KEY="$remote_key" FORCE="$force"       REMOTE_OWNER="$remote_owner" REMOTE_GROUP="$remote_group"       CERT_MODE="$cert_mode" KEY_MODE="$key_mode"       bash <<'REMOTE'
 set -euo pipefail
 changed=0
 if ! cmp -s "${REMOTE_CERT}.new" "${REMOTE_CERT}" 2>/dev/null; then
@@ -541,7 +548,10 @@ fi
 rm -f "${REMOTE_CERT}.new" "${REMOTE_KEY}.new"
 [[ "$changed" -eq 1 || "$FORCE" -eq 1 ]] && echo "updated" || echo "unchanged"
 REMOTE
-    )
+    ); then
+      warn "SSH-Verbindung zu ${host} fehlgeschlagen — Target übersprungen"
+      return 1
+    fi
 
     if [[ "$result" == "updated" ]]; then
       if [[ -n "$reload_cmd" ]]; then
@@ -550,8 +560,11 @@ REMOTE
           || warn "Reload fehlgeschlagen (nicht kritisch)"
       fi
       info "Aktualisiert"
-    else
+    elif [[ "$result" == "unchanged" ]]; then
       info "Unverändert — kein Neustart"
+    else
+      warn "Unerwartete Antwort von ${host}: '${result:-leer}' — Target übersprungen"
+      return 1
     fi
   else
     # ── Lokales Deployment ─────────────────────────────────────────────────

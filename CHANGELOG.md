@@ -5,6 +5,11 @@ Alle wichtigen Änderungen an dns-mgr werden in dieser Datei dokumentiert.
 Das Format basiert auf [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 das Projekt folgt [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-06-20
+
+### Behoben
+- `cert_deploy_target`: Fehlschläge bei `scp`/`ssh` zum Zielhost (z.B. nicht erreichbar) wurden bisher fälschlich als `Unverändert — kein Neustart` gemeldet und in der Gesamtsumme als erfolgreich gezählt. Ursache: `set -e` greift nicht innerhalb von `if`-Bedingungen, daher lief die Funktion nach einem fehlgeschlagenen Transfer einfach weiter und landete im "kein Update nötig"-Zweig. Exit-Codes von `scp`/`ssh` werden jetzt explizit geprüft; bei Fehlschlag wird gewarnt und das Target als übersprungen gezählt.
+
 ## [0.4.1] - 2026-06-20
 
 ### Behoben
