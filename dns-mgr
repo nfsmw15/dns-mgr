@@ -230,6 +230,24 @@ get_mta_sts_id() {
 ### TRAEFIK CONFIG
 ### ═══════════════════════════════════════════════════════════════════════════
 
+# atomic_write_traefik <ziel-datei>  (Inhalt via stdin/Heredoc)
+# Schreibt in eine Temp-Datei im selben Verzeichnis, validiert YAML falls
+# moeglich und ersetzt die Zieldatei per mv (atomarer rename) — verhindert
+# dass Traefiks fsnotify-Watcher (watch: true) eine angeschnittene Datei liest.
+atomic_write_traefik() {
+  local target="$1"
+  local tmp; tmp=$(mktemp "${target}.XXXXXX")
+  cat > "$tmp"
+  if command -v python3 &>/dev/null && python3 -c 'import yaml' 2>/dev/null; then
+    if ! python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1]))' "$tmp" 2>/dev/null; then
+      rm -f "$tmp"
+      die "Ungültiges YAML für ${target} generiert — Abbruch, bestehende Config bleibt aktiv"
+    fi
+  fi
+  chmod 644 "$tmp"
+  mv -f "$tmp" "$target"
+}
+
 write_traefik_http() {
   # write_traefik_http <service-name> <domain> [domain2 ...] -- <backend-url> [optionen]
   # --insecure:              Backend-Zertifikat nicht prüfen (pfSense, Proxmox etc.)
@@ -308,7 +326,7 @@ write_traefik_http() {
 
   log "Traefik HTTP: ${service_name} → ${backend_url}$([ $insecure -eq 1 ] && echo ' (insecure)')$([ -n "$prefix" ] && echo " (prefix: ${prefix})")$([ -n "$strip_prefix" ] && echo " (strip: ${strip_prefix})")$([ -n "$basic_auth" ] && echo ' (basic-auth)')$([ -n "$redirect_url" ] && echo " (redirect: ${redirect_url})")"
 
-  cat > "${TRAEFIK_CONF_DIR}/${service_name}.yml" <<EOF
+  atomic_write_traefik "${TRAEFIK_CONF_DIR}/${service_name}.yml" <<EOF
 http:
   routers:
     ${service_name}:
@@ -329,12 +347,13 @@ EOF
 }
 
 write_traefik_http_san() {
-  # write_traefik_http_san <service-name> <main-domain> <san1> [san2...] -- <backend-url>
+  # write_traefik_http_san <service-name> <main-domain> <san1> [san2...] -- <backend-url> [--insecure]
   # Erstellt eine Route mit explizitem SAN-Zertifikat (für Mailcow multi-domain)
   local service_name="$1" main_domain="$2"; shift 2
-  local sans=() backend_url="" sep=0
+  local sans=() backend_url="" sep=0 insecure=0
   for arg in "$@"; do
-    [[ "$arg" == "--" ]] && { sep=1; continue; }
+    if [[ "$arg" == "--" ]];         then sep=1; continue; fi
+    if [[ "$arg" == "--insecure" ]]; then insecure=1; continue; fi
     [[ $sep -eq 0 ]] && sans+=("$arg") || backend_url="$arg"
   done
   [[ -z "$backend_url" ]] && die "write_traefik_http_san: Backend-URL fehlt"
@@ -345,8 +364,19 @@ write_traefik_http_san() {
   local sans_yaml=""
   for san in "${sans[@]}"; do sans_yaml+="              - ${san}"$'\n'; done
 
-  log "Traefik SAN-Route: ${service_name} → ${backend_url} (main: ${main_domain}, ${#sans[@]} SANs)"
-  cat > "${TRAEFIK_CONF_DIR}/${service_name}.yml" <<EOF
+  # Gleiche Middlewares wie write_traefik_http, damit Einzelrouter
+  # (mail-<domain>) und diese SAN-Sammelroute sich identisch verhalten —
+  # unabhaengig davon welcher der beiden Router bei Traefik den Zuschlag
+  # bekommt (laengere rule gewinnt i.d.R., das ist hier die SAN-Route).
+  local middlewares="https-forward"
+  [[ -n "${HSTS_MAX_AGE:-}" ]] && middlewares+=", hsts"
+  local middlewares_yaml="[${middlewares}]"
+
+  local transport_line=""
+  [[ $insecure -eq 1 ]] && transport_line="        serversTransport: insecure"
+
+  log "Traefik SAN-Route: ${service_name} → ${backend_url}$([ $insecure -eq 1 ] && echo ' (insecure)') (main: ${main_domain}, ${#sans[@]} SANs)"
+  atomic_write_traefik "${TRAEFIK_CONF_DIR}/${service_name}.yml" <<EOF
 http:
   routers:
     ${service_name}:
@@ -357,13 +387,15 @@ http:
         domains:
           - main: ${main_domain}
             sans:
-${sans_yaml}      service: ${service_name}
+${sans_yaml}      middlewares: ${middlewares_yaml}
+      service: ${service_name}
   services:
     ${service_name}:
       loadBalancer:
         servers:
           - url: "${backend_url}"
         passHostHeader: true
+${transport_line}
 EOF
 }
 
@@ -453,7 +485,7 @@ rebuild_mailcow_san_route() {
 
   write_traefik_http_san \
     "mailcow-all" "$main_domain" "${sans[@]}" \
-    -- "https://${MAILCOW_IP}:443"
+    -- "https://${MAILCOW_IP}:443" --insecure
 
   info "SAN main-Domain: ${main_domain} | ${#sans[@]} SANs"
 }
@@ -804,11 +836,12 @@ cmd_add_mail_records() {
 
   set_record "$zone" "_autodiscover._tcp" "SRV" "0 1 443 mail.${domain}." 3600
 
-  # Individuelle Route pro Domain (wird in SAN-Route zusammengefasst)
+  # Individuelle Route pro Domain (wird in SAN-Route zusammengefasst, dient
+  # rebuild_mailcow_san_route zugleich als Datenquelle fuer die SAN-Liste)
   write_traefik_http "mail-$(safe_name "$domain")" \
     "mail.${domain}" "webmail.${domain}" \
     "autoconfig.${domain}" "autodiscover.${domain}" "mta-sts.${domain}" \
-    -- "https://${MAILCOW_IP}:443"
+    -- "https://${MAILCOW_IP}:443" --insecure
 
   # Gemeinsames SAN-Zertifikat für alle Mail-Domains neu aufbauen
   rebuild_mailcow_san_route
