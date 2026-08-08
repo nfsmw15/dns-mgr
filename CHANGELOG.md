@@ -5,6 +5,14 @@ Alle wichtigen Änderungen an dns-mgr werden in dieser Datei dokumentiert.
 Das Format basiert auf [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 das Projekt folgt [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] - 2026-08-08
+
+### Behoben
+- `rebuild_mailcow_san_route`/`write_traefik_http_san`: Der SAN-Sammelrouter `mailcow-all` setzte kein `serversTransport: insecure`. Da das Mailcow-Backend per IP (`https://192.168.1.106:443`) statt Hostname angesprochen wird, sendet Traefik kein SNI (bei IP-Zielen laut RFC 6066 nicht zulässig), Mailcows nginx liefert dadurch das falsche/Default-Zertifikat aus, Traefik lehnt die Backend-Verbindung ab → `Internal Server Error`, obwohl der direkte Zugriff auf Mailcow funktioniert. `write_traefik_http_san` unterstützt jetzt wie `write_traefik_http` ein `--insecure`-Flag, `rebuild_mailcow_san_route` nutzt es. Zusätzlich fehlten dem SAN-Router die `middlewares` (`https-forward`, `hsts`) der Einzelrouter (`mail-<domain>`) — beide Router matchen dieselben Hosts und müssen sich daher identisch verhalten, unabhängig davon welcher bei Traefik den Zuschlag bekommt.
+
+### Technisch
+- Neue Hilfsfunktion `atomic_write_traefik`: Traefik-Configs (`write_traefik_http`, `write_traefik_http_san`) werden jetzt über Temp-Datei + `mv` atomar geschrieben statt per `cat > datei.yml`, inkl. optionaler YAML-Validierung (falls `python3`+`pyyaml` vorhanden) vor dem Ersetzen — verhindert dass Traefiks `watch: true` eine angeschnittene Datei einliest.
+
 ## [0.4.3] - 2026-06-20
 
 ### Behoben
