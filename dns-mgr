@@ -1092,6 +1092,27 @@ cmd_enable_dnssec() {
 }
 
 ### ═══════════════════════════════════════════════════════════════════════════
+### KOMMANDO: fix-soa
+### Korrigiert die SOA einer bestehenden Zone auf den konfigurierten Wert.
+### Für Zonen, die nicht über cmd_create_zone entstanden sind (z.B. vorher
+### schon manuell angelegt) und daher noch PowerDNS' Platzhalter-SOA tragen
+### ("a.misconfigured.dns.server.invalid.").
+### ═══════════════════════════════════════════════════════════════════════════
+
+cmd_fix_soa() {
+  local domain="${1:-}"
+  [[ -z "$domain" ]] && die "fix-soa: Domain fehlt"
+
+  local zone; zone=$(get_zone_for_domain "$domain")
+  [[ -z "$zone" ]] && die "Keine PowerDNS-Zone für ${domain} gefunden"
+
+  log "Korrigiere SOA für ${zone} (MNAME: ${NS_RECORDS[0]}) ..."
+  set_record "$zone" "@" "SOA" \
+    "${NS_RECORDS[0]} ${SOA_HOSTMASTER} $(date +%Y%m%d01) 3600 900 604800 300" 3600
+  log "SOA für ${zone} korrigiert"
+}
+
+### ═══════════════════════════════════════════════════════════════════════════
 ### KOMMANDO: remove
 ### ═══════════════════════════════════════════════════════════════════════════
 
@@ -1805,6 +1826,7 @@ case "${1:-help}" in
   add-mail)      shift; cmd_add_mail_records "$@" ;;
   add-srv)       shift; cmd_add_srv "$@" ;;
   enable-dnssec) shift; cmd_enable_dnssec "$@" ;;
+  fix-soa)       shift; cmd_fix_soa "$@" ;;
   add-service)   shift; cmd_add_service "$@" ;;
   remove)        shift; cmd_remove "$@" ;;
   mailcow-sync)    shift; cmd_mailcow_sync "$@" ;;
@@ -1837,6 +1859,11 @@ DOMAIN-VERWALTUNG
       Aktiviert DNSSEC-Signing (CSK, ECDSAP256SHA256) für die Zone,
       gibt den DS-Record zum manuellen Eintrag beim Registrar aus.
       Einmalig — PowerDNS rotiert Keys nicht automatisch.
+
+  fix-soa <domain>
+      Korrigiert die SOA einer bestehenden Zone (MNAME/Hostmaster/Serial)
+      auf den konfigurierten Wert. Für Zonen die PowerDNS' Platzhalter-SOA
+      "a.misconfigured.dns.server.invalid." tragen (vor dns-mgr angelegt).
 
   add-mail <domain>
       MX, SPF, DKIM, DMARC, MTA-STS, TLSRPT, SRV
