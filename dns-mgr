@@ -1030,6 +1030,57 @@ cmd_add_srv() {
 }
 
 ### ═══════════════════════════════════════════════════════════════════════════
+### KOMMANDO: enable-dnssec
+### Aktiviert DNSSEC-Signing für eine Zone und gibt den DS-Record zum
+### manuellen Eintrag beim Registrar aus. PowerDNS rotiert Keys nicht von
+### selbst — der DS-Record muss daher nur einmalig gesetzt werden, es sei
+### denn es wird spaeter manuell ein Key-Rollover durchgefuehrt.
+### ═══════════════════════════════════════════════════════════════════════════
+
+cmd_enable_dnssec() {
+  local domain="${1:-}"
+  [[ -z "$domain" ]] && die "enable-dnssec: Domain fehlt"
+
+  local zone; zone=$(get_zone_for_domain "$domain")
+  [[ -z "$zone" ]] && die "Keine PowerDNS-Zone für ${domain} gefunden"
+
+  local keys
+  keys=$(pdns_get "/servers/localhost/zones/${zone}./cryptokeys") \
+    || die "PowerDNS-API: Cryptokeys für ${zone} konnten nicht abgerufen werden"
+
+  local active_signing
+  active_signing=$(echo "$keys" \
+    | jq -r '.[] | select(.active==true and (.keytype=="csk" or .keytype=="ksk"))')
+
+  if [[ -z "$active_signing" ]]; then
+    log "Aktiviere DNSSEC für ${zone} (CSK, ECDSAP256SHA256) ..."
+    keys=$(pdns_post "/servers/localhost/zones/${zone}./cryptokeys" \
+      '{"keytype":"csk","active":true,"algorithm":"ECDSAP256SHA256"}') \
+      || die "DNSSEC-Key für ${zone} konnte nicht angelegt werden"
+    # Einzelnes Cryptokey-Objekt (POST-Antwort) in ein Array packen,
+    # damit der jq-Filter unten fuer beide Faelle gleich funktioniert
+    keys="[${keys}]"
+  else
+    log "DNSSEC für ${zone} bereits aktiv — zeige vorhandene DS-Record(s)"
+  fi
+
+  local ds_records
+  ds_records=$(echo "$keys" \
+    | jq -r '.[] | select(.active==true and (.keytype=="csk" or .keytype=="ksk")) | .ds[]?')
+
+  [[ -z "$ds_records" ]] && die "Kein DS-Record von PowerDNS erhalten — Zone/Key manuell prüfen"
+
+  log ""
+  log "══ DS-Record(s) — manuell beim Registrar (z.B. INWX → Domain → DNSSEC) eintragen ══"
+  while IFS= read -r ds; do
+    log "   ${ds}"
+  done <<< "$ds_records"
+  log "═══════════════════════════════════════════════════════════════════════════════"
+  log "Hinweis: PowerDNS rotiert Keys nicht automatisch — der DS-Record bleibt stabil,"
+  log "solange kein manuelles Key-Rollover durchgeführt wird."
+}
+
+### ═══════════════════════════════════════════════════════════════════════════
 ### KOMMANDO: remove
 ### ═══════════════════════════════════════════════════════════════════════════
 
@@ -1742,6 +1793,7 @@ case "${1:-help}" in
   add-web)       shift; cmd_add_web "$@" ;;
   add-mail)      shift; cmd_add_mail_records "$@" ;;
   add-srv)       shift; cmd_add_srv "$@" ;;
+  enable-dnssec) shift; cmd_enable_dnssec "$@" ;;
   add-service)   shift; cmd_add_service "$@" ;;
   remove)        shift; cmd_remove "$@" ;;
   mailcow-sync)    shift; cmd_mailcow_sync "$@" ;;
@@ -1769,6 +1821,11 @@ DOMAIN-VERWALTUNG
   add-srv <zone> <service> <proto> <prio> <weight> <port> <target>
       Generischer SRV-Record setzen
       Beispiel: dns-mgr add-srv nfsmw15.de mumble tcp 0 10 64739 mumble.nfsmw15.de
+
+  enable-dnssec <domain>
+      Aktiviert DNSSEC-Signing (CSK, ECDSAP256SHA256) für die Zone,
+      gibt den DS-Record zum manuellen Eintrag beim Registrar aus.
+      Einmalig — PowerDNS rotiert Keys nicht automatisch.
 
   add-mail <domain>
       MX, SPF, DKIM, DMARC, MTA-STS, TLSRPT, SRV

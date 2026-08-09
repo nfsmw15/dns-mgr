@@ -5,6 +5,11 @@ Alle wichtigen Änderungen an dns-mgr werden in dieser Datei dokumentiert.
 Das Format basiert auf [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 das Projekt folgt [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-08-09
+
+### Hinzugefügt
+- Neuer Befehl `enable-dnssec <domain>`: Aktiviert DNSSEC-Signing für eine PowerDNS-Zone (Combined Signing Key, Algorithmus ECDSAP256SHA256) über die PowerDNS-API und gibt den fertigen DS-Record zum manuellen Eintrag beim Registrar (z.B. INWX) aus. Bewusst ein einmaliger, manuell angestoßener Befehl ohne Cron-Anbindung — PowerDNS rotiert Keys nicht automatisch, der DS-Record bleibt nach dem einmaligen Eintrag stabil, solange kein manuelles Key-Rollover erfolgt. Erkennt bereits aktive Keys und zeigt in dem Fall nur deren DS-Record erneut an, statt einen weiteren Key anzulegen.
+
 ## [0.4.4] - 2026-08-08
 
 ### Behoben

@@ -177,6 +177,9 @@ dns-mgr add-service old.example.com 192.168.1.100 80 --redirect=https://new.exam
 # SRV-Record setzen:
 dns-mgr add-srv example.com mumble tcp 0 10 64738 mumble.example.com
 
+# DNSSEC aktivieren (einmalig, gibt DS-Record für den Registrar aus):
+dns-mgr enable-dnssec example.com
+
 # Domain entfernen:
 dns-mgr remove example.com
 dns-mgr remove example.com --force
