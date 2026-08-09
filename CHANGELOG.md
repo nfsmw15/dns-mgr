@@ -5,6 +5,14 @@ Alle wichtigen Änderungen an dns-mgr werden in dieser Datei dokumentiert.
 Das Format basiert auf [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 das Projekt folgt [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-08-09
+
+### Behoben
+- `enable-dnssec`: PowerDNS liefert `dnskey`/`ds` nur als reine RDATA ohne Owner/TTL/Class/Type. Ausgabe erweitert um das volle DNSKEY-RR im Presentation-Format — die meisten Registrare (u.a. INWX) erwarten primär das DNSKEY und berechnen den DS-Record selbst daraus.
+
+### Hinzugefügt
+- Neuer Befehl `fix-soa <domain>`: Korrigiert die SOA einer bestehenden Zone auf den konfigurierten Wert. Betrifft Zonen, die vor dns-mgr existierten (z.B. per `add-mail` nur ergänzt statt über `create_zone` angelegt) und dadurch noch PowerDNS' Platzhalter-SOA `a.misconfigured.dns.server.invalid.` tragen.
+
 ## [0.5.0] - 2026-08-09
 
 ### Hinzugefügt
