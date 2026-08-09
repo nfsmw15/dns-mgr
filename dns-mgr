@@ -420,8 +420,12 @@ EOF
 
 remove_traefik_config() {
   for f in "${TRAEFIK_CONF_DIR}/${1}.yml" "${TRAEFIK_CONF_DIR}/${1}-tcp.yml"; do
-    [[ -f "$f" ]] && rm -f "$f" && log "Traefik-Config gelöscht: ${f}"
+    if [[ -f "$f" ]]; then
+      rm -f "$f"
+      log "Traefik-Config gelöscht: ${f}"
+    fi
   done
+  return 0
 }
 
 write_hsts_middleware() {

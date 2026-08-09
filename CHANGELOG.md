@@ -5,6 +5,11 @@ Alle wichtigen Änderungen an dns-mgr werden in dieser Datei dokumentiert.
 Das Format basiert auf [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 das Projekt folgt [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.3] - 2026-08-09
+
+### Behoben
+- `remove_traefik_config`: Die Schleife nutzte `[[ -f "$f" ]] && rm -f "$f" && log ...` als letzte Anweisung. Existierte die zuletzt geprüfte Datei (typischerweise `<name>-tcp.yml`, die fast nie existiert) nicht, lieferte `[[ -f "$f" ]]` Exit-Code 1 — und da das der letzte ausgeführte Befehl der Funktion war, gab auch die Funktion selbst 1 zurück. Wegen `set -euo pipefail` brach `hestia-sync` dadurch bei **jedem** entfernten HestiaCP-Domain sofort ab, bevor `$HESTIA_STATE` aktualisiert wurde — mit der Folge, dass die State-Datei dauerhaft veraltet blieb (nachweislich seit 2026-05-01 unverändert), bei jedem Sync-Lauf dieselben längst existierenden Domains erneut als "neu" erkannt und komplett neu provisioniert wurden, und dadurch unnötig SOA-Serials hochgezählt sowie NOTIFY/AXFR an alle Secondaries ausgelöst wurden. `remove_traefik_config` gibt jetzt zuverlässig `0` zurück, unabhängig davon ob die geprüften Dateien existieren.
+
 ## [0.6.2] - 2026-08-09
 
 ### Geändert
