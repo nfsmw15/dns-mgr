@@ -5,6 +5,13 @@ Alle wichtigen Änderungen an dns-mgr werden in dieser Datei dokumentiert.
 Das Format basiert auf [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 das Projekt folgt [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2] - 2026-08-09
+
+### Geändert
+- `mailcow-sync`: Verbindungstest und Domainliste riefen bisher zweimal identisch `GET /get/domain/all` auf (einmal nur für den HTTP-Status, einmal für den Body). Zusammengefasst zu einem einzigen Request — Fehlerbehandlung (nicht erreichbar / falscher Key / ungültige Antwort) unverändert, jetzt explizit statt sich auf den `curl -f`-Seiteneffekt des entfernten zweiten Requests zu verlassen.
+- Empfohlenes und tatsächlich einzurichtendes Cron-Intervall für `mailcow-sync` von `* * * * *` auf `*/5 * * * *` reduziert (README) — analog zu `hestia-sync` in 0.6.1.
+- Lastabschätzung: vorher 1.440 Läufe/Tag × 2 Requests = 2.880 Requests/Tag, nachher 288 Läufe/Tag × 1 Request = 288 Requests/Tag — Reduktion um 90%. Die State-Datei `mailcow-domains.json` wird dadurch ebenfalls nur noch 288 statt 1.440 Mal täglich geschrieben.
+
 ## [0.6.1] - 2026-08-09
 
 ### Geändert

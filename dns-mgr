@@ -1209,19 +1209,26 @@ cmd_mailcow_sync() {
   mkdir -p "$STATE_DIR"
   [[ -f "$MAILCOW_STATE" ]] || echo "[]" > "$MAILCOW_STATE"
 
-  # Verbindungstest
-  local http_code
-  http_code=$(curl -sk -o /dev/null -w "%{http_code}" \
-    -H "X-API-Key: ${MAILCOW_KEY}" "${MAILCOW_API}/get/domain/all") || true
+  # Verbindungstest + Domainliste in einem einzigen Request (statt zwei
+  # identischen get/domain/all-Aufrufen — halbiert die Mailcow-API-Last
+  # pro Sync-Lauf). HTTP-Status wird per -w als letzte Zeile angehängt und
+  # danach wieder vom Body getrennt.
+  local mc_response http_code mc_body
+  mc_response=$(curl -sk -H "X-API-Key: ${MAILCOW_KEY}" \
+    "${MAILCOW_API}/get/domain/all" \
+    -w $'\n%{http_code}') || true
+  http_code="${mc_response##*$'\n'}"
+  mc_body="${mc_response%$'\n'*}"
+
   case "$http_code" in
     000) die "Mailcow nicht erreichbar (${MAILCOW_IP}) — LXC online?" ;;
     401) die "Mailcow-API: falscher Key — MAILCOW_KEY in dns-mgr.conf prüfen" ;;
+    200) : ;;
+    *)   die "Mailcow-API: ungültige Antwort" ;;
   esac
 
   local current_domains
-  current_domains=$(curl -sfk -H "X-API-Key: ${MAILCOW_KEY}" \
-    "${MAILCOW_API}/get/domain/all" \
-    | jq '[.[].domain_name]' 2>/dev/null) \
+  current_domains=$(echo "$mc_body" | jq '[.[].domain_name]' 2>/dev/null) \
     || die "Mailcow-API: ungültige Antwort"
 
   local new_domains
