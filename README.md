@@ -89,7 +89,7 @@ systemctl daemon-reload
 
 # 6. Cron-Jobs einrichten
 crontab -e
-# * * * * * /usr/local/bin/dns-mgr hestia-sync  >> /var/log/dns-mgr-hestia.log 2>&1
+# */5 * * * * /usr/local/bin/dns-mgr hestia-sync  >> /var/log/dns-mgr-hestia.log 2>&1
 # * * * * * /usr/local/bin/dns-mgr mailcow-sync >> /var/log/dns-mgr-mailcow.log 2>&1
 ```
 

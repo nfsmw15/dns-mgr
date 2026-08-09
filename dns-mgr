@@ -1444,10 +1444,17 @@ cmd_hestia_sync() {
   # HestiaCP REST-API: access_key + secret_key als POST-Felder
   local hestia_auth="access_key=${HESTIA_ACCESS_KEY}&secret_key=${HESTIA_SECRET_KEY}"
 
-  # Verbindungstest
-  local hc_code
-  hc_code=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "${HESTIA_API}" \
-    --data "${hestia_auth}&cmd=v-list-users&arg1=json") || true
+  # Verbindungstest + Userliste in einem einzigen Request (statt zwei
+  # identischen v-list-users-Aufrufen — halbiert die Hestia-API-Last pro
+  # Sync-Lauf). HTTP-Status wird per -w als letzte Zeile angehängt und
+  # danach wieder vom Body getrennt.
+  local hc_response hc_code hc_body
+  hc_response=$(curl -sk -X POST "${HESTIA_API}" \
+    --data "${hestia_auth}&cmd=v-list-users&arg1=json" \
+    -w $'\n%{http_code}') || true
+  hc_code="${hc_response##*$'\n'}"
+  hc_body="${hc_response%$'\n'*}"
+
   case "$hc_code" in
     000) die "HestiaCP nicht erreichbar (${HESTIA_IP}) — LXC online?" ;;
     200) : ;;
@@ -1456,9 +1463,7 @@ cmd_hestia_sync() {
 
   # Alle User abrufen
   local all_users
-  all_users=$(curl -sk -X POST "${HESTIA_API}" \
-    --data "${hestia_auth}&cmd=v-list-users&arg1=json" \
-    | jq -r 'keys[]' 2>/dev/null) \
+  all_users=$(echo "$hc_body" | jq -r 'keys[]' 2>/dev/null) \
     || die "HestiaCP-API: ungültige Antwort"
 
   # Aktuelle Domains als JSON: { "user": ["domain1", "domain2"], ... }
@@ -2006,7 +2011,7 @@ BEISPIELE
   dns-mgr deploy-certs                                    # alle Targets
   dns-mgr deploy-certs --target mailcow --force
   dns-mgr hestia-sync                             # manuell testen
-  dns-mgr hestia-sync                             # via Cron: * * * * *
+  dns-mgr hestia-sync                             # via Cron: */5 * * * *
   dns-mgr watch-certs                                     # Watcher starten
   dns-mgr init-config                                     # Ersteinrichtung
   DNS_MGR_CONF=/andere/config.conf dns-mgr list           # andere Config

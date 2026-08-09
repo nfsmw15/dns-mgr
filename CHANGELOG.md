@@ -5,6 +5,12 @@ Alle wichtigen Änderungen an dns-mgr werden in dieser Datei dokumentiert.
 Das Format basiert auf [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 das Projekt folgt [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-08-09
+
+### Geändert
+- `hestia-sync`: Verbindungstest und User-Abfrage riefen bisher zweimal identisch `v-list-users` auf (einmal nur für den HTTP-Status, einmal für den Body). Zusammengefasst zu einem einzigen Request — halbiert die Hestia-API-Last pro Sync-Lauf, Fehlerbehandlung (nicht erreichbar / HTTP-Fehler / ungültiges JSON) unverändert.
+- Empfohlenes Cron-Intervall für `hestia-sync` von `* * * * *` auf `*/5 * * * *` reduziert (README + eingebauter Hilfetext) — auf einem produktiven HestiaCP-Server führte die minütliche Abfrage (inkl. Hestia-interner `v-check-access-key`/Sudo-Aufrufe pro User) zu unnötig hoher journald-Schreiblast. `mailcow-sync` bleibt unverändert bei `* * * * *`.
+
 ## [0.6.0] - 2026-08-09
 
 ### Hinzugefügt
