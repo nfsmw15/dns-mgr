@@ -1031,9 +1031,9 @@ cmd_add_srv() {
 
 ### ═══════════════════════════════════════════════════════════════════════════
 ### KOMMANDO: enable-dnssec
-### Aktiviert DNSSEC-Signing für eine Zone und gibt den DS-Record zum
+### Aktiviert DNSSEC-Signing für eine Zone und gibt DNSKEY- und DS-Record zum
 ### manuellen Eintrag beim Registrar aus. PowerDNS rotiert Keys nicht von
-### selbst — der DS-Record muss daher nur einmalig gesetzt werden, es sei
+### selbst — die Records müssen daher nur einmalig gesetzt werden, es sei
 ### denn es wird spaeter manuell ein Key-Rollover durchgefuehrt.
 ### ═══════════════════════════════════════════════════════════════════════════
 
@@ -1061,22 +1061,33 @@ cmd_enable_dnssec() {
     # damit der jq-Filter unten fuer beide Faelle gleich funktioniert
     keys="[${keys}]"
   else
-    log "DNSSEC für ${zone} bereits aktiv — zeige vorhandene DS-Record(s)"
+    log "DNSSEC für ${zone} bereits aktiv — zeige vorhandene Records erneut"
   fi
 
-  local ds_records
+  # PowerDNS liefert dnskey/ds nur als reine RDATA (ohne Owner/TTL/Class/Type) —
+  # fuers Copy-Paste beim Registrar (z.B. INWX-Formular) muss das volle
+  # Presentation-Format davorgesetzt werden.
+  local dnskey_records ds_records
+  dnskey_records=$(echo "$keys" \
+    | jq -r '.[] | select(.active==true and (.keytype=="csk" or .keytype=="ksk")) | .dnskey')
   ds_records=$(echo "$keys" \
     | jq -r '.[] | select(.active==true and (.keytype=="csk" or .keytype=="ksk")) | .ds[]?')
 
-  [[ -z "$ds_records" ]] && die "Kein DS-Record von PowerDNS erhalten — Zone/Key manuell prüfen"
+  [[ -z "$dnskey_records" ]] && die "Kein DNSKEY von PowerDNS erhalten — Zone/Key manuell prüfen"
 
   log ""
-  log "══ DS-Record(s) — manuell beim Registrar (z.B. INWX → Domain → DNSSEC) eintragen ══"
+  log "══ DNSSEC-Records für ${zone} — beim Registrar eintragen (z.B. INWX → Domain → DNSSEC) ══"
+  log "DNSKEY RR (primär — die meisten Registrare, u.a. INWX, berechnen den DS-Record daraus):"
+  while IFS= read -r dnskey; do
+    log "   ${zone}. 3600 IN DNSKEY ${dnskey}"
+  done <<< "$dnskey_records"
+  log ""
+  log "DS Record (falls der Registrar stattdessen/zusätzlich den DS will):"
   while IFS= read -r ds; do
-    log "   ${ds}"
+    log "   ${zone}. 3600 IN DS ${ds}"
   done <<< "$ds_records"
-  log "═══════════════════════════════════════════════════════════════════════════════"
-  log "Hinweis: PowerDNS rotiert Keys nicht automatisch — der DS-Record bleibt stabil,"
+  log "═══════════════════════════════════════════════════════════════════════════════════"
+  log "Hinweis: PowerDNS rotiert Keys nicht automatisch — die Records bleiben stabil,"
   log "solange kein manuelles Key-Rollover durchgeführt wird."
 }
 
