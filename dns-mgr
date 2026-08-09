@@ -529,6 +529,48 @@ cert_extract() {
   info "SANs: ${sans}"
 }
 
+# publish_mailcow_tlsa <cert-datei>
+# Berechnet TLSA 3 1 1 (DANE-EE, SPKI, SHA-256 — RFC 7671 Empfehlung, robust
+# gegenüber Zertifikatserneuerung solange derselbe Key wiederverwendet wird)
+# aus dem SMTP-Zertifikat und trägt den Record unter _25._tcp.<mail.domain>
+# für jede bekannte Mail-Domain ein (alle teilen sich das gleiche SAN-Cert).
+# Wirkungslos ohne aktives DNSSEC auf der jeweiligen Zone (RFC 7672: MTAs
+# prüfen DANE nur bei DNSSEC-validierten Domains) — daher gefahrlos für
+# alle Mail-Domains gleichzeitig pflegbar, auch die ohne DNSSEC.
+publish_mailcow_tlsa() {
+  local cert_file="$1"
+
+  local tlsa_hash
+  tlsa_hash=$(openssl x509 -in "$cert_file" -noout -pubkey 2>/dev/null \
+    | openssl pkey -pubin -outform DER 2>/dev/null \
+    | openssl dgst -sha256 -hex 2>/dev/null | awk '{print $NF}')
+  if [[ -z "$tlsa_hash" ]]; then
+    warn "TLSA-Hash konnte nicht berechnet werden — DANE-Update übersprungen"
+    return 1
+  fi
+
+  local tlsa_content="3 1 1 ${tlsa_hash}"
+  local updated=0
+
+  for conf in "${TRAEFIK_CONF_DIR}"/mail-*.yml; do
+    [[ -f "$conf" ]] || continue
+    # domains[0] in write_traefik_http ist immer "mail.<domain>" (siehe
+    # cmd_add_mail_records) — erster Host()-Treffer reicht daher aus
+    local mail_host; mail_host=$(grep -oP "Host\(\`\K[^\`]+" "$conf" | head -1)
+    [[ -z "$mail_host" ]] && continue
+
+    local domain="${mail_host#mail.}"
+    local zone; zone=$(get_zone_for_domain "$domain")
+    [[ -z "$zone" ]] && continue
+    local sub="${mail_host%.${zone}}"
+
+    set_record "$zone" "_25._tcp.${sub}" "TLSA" "$tlsa_content" 3600
+    (( updated++ )) || true
+  done
+
+  info "TLSA (_25._tcp, DANE) für ${updated} Mail-Domain(s) aktualisiert"
+}
+
 cert_deploy_target() {
   local target_name="$1" force="${2:-0}"
   local cfg="${CERT_TARGETS[$target_name]:-}"
@@ -625,6 +667,13 @@ REMOTE
       info "Lokal unverändert"
     fi
   fi
+
+  # Nur an dieser Stelle erreicht wenn Extraktion + Deployment tatsächlich
+  # erfolgreich waren — bei Fehlern oben ist die Funktion schon per
+  # "return 1" raus, TLSA würde sonst auf einen noch nicht live
+  # deployten Cert zeigen (DANE ist fail-closed, das wäre schlimmer als
+  # gar kein DANE).
+  [[ "$target_name" == "mailcow" ]] && publish_mailcow_tlsa "${tmp_dir}/cert.pem"
 }
 
 ### ═══════════════════════════════════════════════════════════════════════════

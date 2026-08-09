@@ -5,6 +5,12 @@ Alle wichtigen Änderungen an dns-mgr werden in dieser Datei dokumentiert.
 Das Format basiert auf [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 das Projekt folgt [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-08-09
+
+### Hinzugefügt
+- **DANE/TLSA für Mailcow-SMTP**: `deploy-certs`/`watch-certs` berechnen bei jedem erfolgreichen Deployment des `mailcow`-Cert-Targets automatisch einen `TLSA 3 1 1`-Record (DANE-EE, SPKI, SHA-256 — RFC 7671) aus dem aktuellen SMTP-Zertifikat und tragen ihn unter `_25._tcp.mail.<domain>` für jede bekannte Mail-Domain ein. Läuft komplett im bestehenden Zertifikats-Automatismus mit, keine manuelle Pflege bei Zertifikatserneuerung nötig. Wirkungslos (aber unschädlich) auf Zonen ohne aktives DNSSEC, da DANE-Validierung laut RFC 7672 eine DNSSEC-validierte Zone voraussetzt — kann also gefahrlos für alle Mail-Domains gepflegt werden, auch bevor DNSSEC dort aktiv ist.
+- Neue Hilfsfunktion `publish_mailcow_tlsa`: läuft nur nach tatsächlich erfolgreichem Zertifikats-Deployment (nicht bei SSH/SCP-Fehlern), damit der TLSA-Record nie auf ein noch nicht live deploytes Zertifikat zeigt — DANE ist fail-closed, ein vorzeitiger TLSA-Eintrag wäre schlimmer als gar keiner.
+
 ## [0.5.1] - 2026-08-09
 
 ### Behoben

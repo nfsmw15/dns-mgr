@@ -390,6 +390,8 @@ Nach `systemctl reload nginx` sehen PHP und die nginx Access Logs die echte Clie
 
 ## Zertifikat-Deployment (CERT_TARGETS)
 
+Für das Target `mailcow` wird bei jedem erfolgreichen Deployment automatisch ein `TLSA`-Record (DANE, `_25._tcp.mail.<domain>`) für alle bekannten Mail-Domains aus dem aktuellen SMTP-Zertifikat aktualisiert — kein separater Befehl nötig, läuft im `deploy-certs`/`watch-certs`-Automatismus mit. Der Target-Name muss dafür exakt `mailcow` heißen.
+
 Format: `[name]="host:cert-pfad:key-pfad:reload-cmd:main-domain[:owner:group:cert-mode:key-mode]"`
 
 Die letzten vier Felder `owner`, `group`, `cert-mode` und `key-mode` sind optional.
