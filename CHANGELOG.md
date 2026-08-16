@@ -5,6 +5,11 @@ Alle wichtigen Änderungen an dns-mgr werden in dieser Datei dokumentiert.
 Das Format basiert auf [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 das Projekt folgt [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-08-16
+
+### Hinzugefügt
+- Neuer Befehl `edit <domain> [optionen]`: Liest die bestehende Konfiguration eines `add-service`-Eintrags (Backend-IP/-Port, IPv6, `--insecure`, `--prefix`, `--strip-prefix`, `--basic-auth`, `--redirect`) aus PowerDNS und der Traefik-YAML und ändert nur die explizit angegebenen Werte — alles andere bleibt unverändert erhalten. Erspart das fehleranfällige Rekonstruieren des kompletten ursprünglichen `add-service`-Befehls aus dem Gedächtnis beim Ändern bestehender Einträge. Ohne zusätzliche Optionen zeigt der Befehl nur die aktuelle Konfiguration an (Dry-Run).
+
 ## [0.6.3] - 2026-08-09
 
 ### Behoben

@@ -19,7 +19,7 @@
 # Ort:    /usr/local/bin/dns-mgr  (LXC 120 / Traefik)
 # Rechte: chmod 750, chown root:root
 #
-# Version: 0.4.0
+# Version: 0.7.0
 # Abhängigkeiten: curl, jq, openssl, inotifywait (inotify-tools), ssh, scp
 # =============================================================================
 set -euo pipefail
@@ -209,6 +209,16 @@ delete_record() {
 }
 
 set_ns_records() { set_record_multi "$1" "@" "NS" 3600 "${NS_RECORDS[@]}"; }
+
+get_dns_record() {
+  # get_dns_record <domain> <type>  → aktueller Record-Inhalt oder leer
+  local domain="$1" type="$2"
+  local zone; zone=$(get_zone_for_domain "$domain")
+  [[ -z "$zone" ]] && return 0
+  pdns_get "/servers/localhost/zones/${zone}." 2>/dev/null \
+    | jq -r --arg name "${domain}." --arg type "$type" \
+      '.rrsets[]? | select(.name==$name and .type==$type) | .records[0].content // empty'
+}
 
 get_mta_sts_id() {
   local domain="$1"
@@ -1045,6 +1055,116 @@ EOF
   log "Dienst ${domain} eingerichtet (${type}) → ${backend_ip}:${backend_port} | IPv6: ${ipv6_info}${traefik_info}"
 }
 
+
+### ═══════════════════════════════════════════════════════════════════════════
+### KOMMANDO: edit
+### Liest die bestehende Konfiguration eines add-service-Eintrags (DNS +
+### Traefik-Route) aus PowerDNS und der Traefik-YAML und wendet nur die
+### angegebenen Änderungen an — alle nicht genannten Werte bleiben exakt so
+### erhalten wie sie waren. Erspart das Rekonstruieren des kompletten
+### ursprünglichen add-service-Befehls aus dem Gedächtnis. Ohne zusätzliche
+### Optionen zeigt der Befehl nur die aktuelle Konfiguration an (Dry-Run).
+### ═══════════════════════════════════════════════════════════════════════════
+
+cmd_edit_service() {
+  local domain="${1:-}"
+  [[ -z "$domain" ]] && die "edit: Domain fehlt"
+  shift
+
+  local svc_name; svc_name=$(safe_name "$domain")
+  local yml_file="${TRAEFIK_CONF_DIR}/${svc_name}.yml"
+  local tcp_file="${TRAEFIK_CONF_DIR}/${svc_name}-tcp.yml"
+
+  [[ -f "$tcp_file" ]] && \
+    die "edit: ${domain} ist ein TCP-Dienst — bitte ${tcp_file} manuell anpassen oder per 'remove' + 'add-service --type=tcp' neu anlegen"
+  [[ ! -f "$yml_file" ]] && \
+    die "edit: Keine Traefik-Config für ${domain} gefunden (${yml_file}) — wurde der Dienst mit --no-traefik/--internal angelegt? Dann bitte per 'remove' + 'add-service' neu anlegen."
+
+  # Aktuelle Werte aus der bestehenden Traefik-Config extrahieren (Format
+  # kommt exakt aus write_traefik_http — siehe dort für die YAML-Struktur)
+  local cur_url; cur_url=$(grep -oP '(?<=url: ")[^"]+' "$yml_file" | head -1)
+  [[ -z "$cur_url" ]] && die "edit: Backend-URL konnte nicht aus ${yml_file} gelesen werden"
+  local cur_insecure=0; [[ "$cur_url" == https://* ]] && cur_insecure=1
+  local cur_ip="${cur_url#*://}"; cur_ip="${cur_ip%%:*}"
+  local cur_port="${cur_url##*:}"
+  local cur_prefix cur_strip cur_basic_auth cur_redirect
+  cur_prefix=$(grep -oP '(?<=^        prefix: ).*' "$yml_file" | head -1 || true)
+  cur_strip=$(grep -oP '(?<=^          - )(?!url: )[^"].*' "$yml_file" | head -1 || true)
+  cur_basic_auth=$(grep -oP '(?<=^          - ")[^"]+' "$yml_file" | head -1 || true)
+  cur_redirect=$(grep -oP '(?<=replacement: ")[^"]+' "$yml_file" | head -1 || true)
+
+  local cur_a cur_aaaa
+  cur_a=$(get_dns_record "$domain" "A")
+  cur_aaaa=$(get_dns_record "$domain" "AAAA")
+
+  # Neue Werte = aktuelle Werte, außer per Option explizit überschrieben
+  local new_ip="$cur_ip" new_port="$cur_port" new_insecure=$cur_insecure
+  local new_prefix="$cur_prefix" new_strip="$cur_strip"
+  local new_basic_auth="$cur_basic_auth" new_redirect="$cur_redirect"
+  local new_ipv6="$cur_aaaa"
+
+  for arg in "$@"; do
+    case "$arg" in
+      --ip=*)            new_ip="${arg#--ip=}" ;;
+      --port=*)          new_port="${arg#--port=}" ;;
+      --ipv6=*)          new_ipv6="${arg#--ipv6=}" ;;
+      --no-ipv6)         new_ipv6="" ;;
+      --insecure)        new_insecure=1 ;;
+      --secure)          new_insecure=0 ;;
+      --prefix=*)        new_prefix="${arg#--prefix=}" ;;
+      --no-prefix)       new_prefix="" ;;
+      --strip-prefix=*)  new_strip="${arg#--strip-prefix=}" ;;
+      --no-strip-prefix) new_strip="" ;;
+      --basic-auth=*)    new_basic_auth="${arg#--basic-auth=}" ;;
+      --no-basic-auth)   new_basic_auth="" ;;
+      --redirect=*)      new_redirect="${arg#--redirect=}" ;;
+      --no-redirect)     new_redirect="" ;;
+      *) die "edit: unbekannte Option '${arg}'" ;;
+    esac
+  done
+
+  local cur_auth_display="<keiner>";  [[ -n "$cur_basic_auth" ]] && cur_auth_display="gesetzt"
+  local new_auth_display="<keiner>";  [[ -n "$new_basic_auth" ]] && new_auth_display="gesetzt"
+
+  echo ""
+  echo "Aktuelle Konfiguration: ${domain}"
+  printf "  %-13s %s\n" "Backend:"      "${cur_ip}:${cur_port}$([ $cur_insecure -eq 1 ] && echo ' (insecure)')"
+  printf "  %-13s %s\n" "IPv4 (DNS):"   "${cur_a:-<keiner>}"
+  printf "  %-13s %s\n" "IPv6 (DNS):"   "${cur_aaaa:-<keiner>}"
+  printf "  %-13s %s\n" "Prefix:"       "${cur_prefix:-<keiner>}"
+  printf "  %-13s %s\n" "Strip-Prefix:" "${cur_strip:-<keiner>}"
+  printf "  %-13s %s\n" "Basic-Auth:"   "${cur_auth_display}"
+  printf "  %-13s %s\n" "Redirect:"     "${cur_redirect:-<keiner>}"
+
+  if [[ $# -eq 0 ]]; then
+    echo ""
+    log "Nur Anzeige — keine Änderungen angegeben."
+    log "Optionen: --ip= --port= --ipv6= --no-ipv6 --insecure --secure --prefix= --no-prefix --strip-prefix= --no-strip-prefix --basic-auth= --no-basic-auth --redirect= --no-redirect"
+    return 0
+  fi
+
+  echo ""
+  echo "Neue Konfiguration: ${domain}"
+  printf "  %-13s %s\n" "Backend:"      "${new_ip}:${new_port}$([ $new_insecure -eq 1 ] && echo ' (insecure)')"
+  printf "  %-13s %s\n" "IPv6 (DNS):"   "${new_ipv6:-<keiner>}"
+  printf "  %-13s %s\n" "Prefix:"       "${new_prefix:-<keiner>}"
+  printf "  %-13s %s\n" "Strip-Prefix:" "${new_strip:-<keiner>}"
+  printf "  %-13s %s\n" "Basic-Auth:"   "${new_auth_display}"
+  printf "  %-13s %s\n" "Redirect:"     "${new_redirect:-<keiner>}"
+  echo ""
+
+  local flags=()
+  [[ -z "$cur_a" ]] && flags+=(--no-dns)
+  if [[ -n "$new_ipv6" ]]; then flags+=("--ipv6=${new_ipv6}"); else flags+=(--no-ipv6); fi
+  [[ $new_insecure -eq 1  ]] && flags+=(--insecure)
+  [[ -n "$new_prefix"     ]] && flags+=("--prefix=${new_prefix}")
+  [[ -n "$new_strip"      ]] && flags+=("--strip-prefix=${new_strip}")
+  [[ -n "$new_basic_auth" ]] && flags+=("--basic-auth=${new_basic_auth}")
+  [[ -n "$new_redirect"   ]] && flags+=("--redirect=${new_redirect}")
+
+  log "Wende Änderungen an (DNS REPLACE + Traefik-Config neu schreiben) ..."
+  cmd_add_service "$domain" "$new_ip" "$new_port" "${flags[@]}"
+}
 
 ### ═══════════════════════════════════════════════════════════════════════════
 ### KOMMANDO: add-srv
@@ -1893,6 +2013,7 @@ case "${1:-help}" in
   enable-dnssec) shift; cmd_enable_dnssec "$@" ;;
   fix-soa)       shift; cmd_fix_soa "$@" ;;
   add-service)   shift; cmd_add_service "$@" ;;
+  edit)          shift; cmd_edit_service "$@" ;;
   remove)        shift; cmd_remove "$@" ;;
   mailcow-sync)    shift; cmd_mailcow_sync "$@" ;;
   update-mta-sts) shift; cmd_update_mta_sts "$@" ;;
@@ -1949,6 +2070,21 @@ DOMAIN-VERWALTUNG
       --strip-prefix=/pfad      Pfad aus dem Request entfernen bevor er ans Backend geht
       --basic-auth=user:hash    HTTP Basic Authentication (Hash via: htpasswd -nb user pw)
       --redirect=https://ziel   URL-Weiterleitung
+
+  edit <domain> [optionen]
+      Liest die bestehende DNS/Traefik-Config eines add-service-Eintrags
+      und ändert nur die angegebenen Werte — alles andere bleibt exakt
+      erhalten, kein Rekonstruieren des ursprünglichen Befehls nötig.
+      Ohne Optionen: nur Anzeige der aktuellen Konfiguration.
+      --ip=<ip>                 Backend-IP ändern
+      --port=<port>             Backend-Port ändern
+      --ipv6=::CTID             IPv6 ändern
+      --no-ipv6                 IPv6 entfernen
+      --insecure / --secure     Backend-Zertifikatsprüfung um-/abschalten
+      --prefix=/pfad / --no-prefix
+      --strip-prefix=/pfad / --no-strip-prefix
+      --basic-auth=user:hash / --no-basic-auth
+      --redirect=https://ziel / --no-redirect
 
   remove <domain> [--force]
       Zone + Traefik-Configs löschen

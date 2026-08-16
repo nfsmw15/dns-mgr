@@ -174,6 +174,11 @@ dns-mgr add-service phpmyadmin.example.com 192.168.1.118 80 --prefix=/phpmyadmin
 dns-mgr add-service intern.example.com 192.168.1.100 80 --basic-auth="admin:$(htpasswd -nb admin passwort | cut -d: -f2)"
 dns-mgr add-service old.example.com 192.168.1.100 80 --redirect=https://new.example.com
 
+# Bestehenden add-service-Eintrag ändern (nur angegebene Werte, Rest bleibt erhalten):
+dns-mgr edit cloud.example.com                         # nur Anzeige der aktuellen Config
+dns-mgr edit cloud.example.com --port=8081              # nur Port ändern
+dns-mgr edit phpmyadmin.example.com --no-prefix         # Prefix entfernen
+
 # SRV-Record setzen:
 dns-mgr add-srv example.com mumble tcp 0 10 64738 mumble.example.com
 
