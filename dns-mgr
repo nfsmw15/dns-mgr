@@ -19,7 +19,7 @@
 # Ort:    /usr/local/bin/dns-mgr  (LXC 120 / Traefik)
 # Rechte: chmod 750, chown root:root
 #
-# Version: 0.7.0
+# Version: 0.7.1
 # Abhängigkeiten: curl, jq, openssl, inotifywait (inotify-tools), ssh, scp
 # =============================================================================
 set -euo pipefail
@@ -1544,12 +1544,40 @@ cmd_cert_list() {
 ### KOMMANDO: list
 ### ═══════════════════════════════════════════════════════════════════════════
 
+### Ermittelt für eine Zone die Herkunft anhand der Sync-State-Dateien: eine
+### Zone gilt als "hestia", wenn sie selbst oder eine ihrer Subdomains laut
+### HESTIA_STATE von hestia-sync angelegt wurde, als "mailcow", wenn sie in
+### MAILCOW_STATE als Mail-Domain geführt wird — sonst als "manuell" (per
+### add-web/add-service ohne Sync-Quelle angelegt).
+zone_origin() {
+  local zone="$1" hestia_domains="$2" mailcow_domains="$3"
+  local origin=""
+  local d
+  while IFS= read -r d; do
+    [[ -z "$d" ]] && continue
+    if [[ "$d" == "$zone" || "$d" == *".${zone}" ]]; then origin="hestia"; break; fi
+  done <<< "$hestia_domains"
+  if grep -qx "$zone" <<< "$mailcow_domains"; then
+    origin="${origin:+${origin}+}mailcow"
+  fi
+  echo "${origin:-manuell}"
+}
+
 cmd_list() {
+  local hestia_known="{}" mailcow_known="[]"
+  [[ -f "$HESTIA_STATE"  ]] && hestia_known=$(cat "$HESTIA_STATE")
+  [[ -f "$MAILCOW_STATE" ]] && mailcow_known=$(cat "$MAILCOW_STATE")
+  local hestia_domains mailcow_domains
+  hestia_domains=$(echo "$hestia_known"  | jq -r '[.[][]]? // [] | unique[]' 2>/dev/null)
+  mailcow_domains=$(echo "$mailcow_known" | jq -r '.[]?' 2>/dev/null)
+
   echo ""
-  echo "PowerDNS-Zonen:"
+  echo "PowerDNS-Zonen (Herkunft: hestia = per hestia-sync, mailcow = per mailcow-sync, manuell = per add-web/add-service):"
   pdns_get "/servers/localhost/zones" \
     | jq -r '.[].name' | sed 's/\.$//' | sort \
-    | while read -r z; do printf "  %s\n" "$z"; done
+    | while read -r z; do
+        printf "  %-45s [%s]\n" "$z" "$(zone_origin "$z" "$hestia_domains" "$mailcow_domains")"
+      done
 
   echo ""
   echo "Traefik-Configs (${TRAEFIK_CONF_DIR}):"
@@ -2135,7 +2163,7 @@ SPLIT-DNS (pfSense Unbound)
       Zeigt alle aktuellen Unbound Host Overrides in pfSense
 
 ÜBERSICHT
-  list          Zonen, Traefik-Configs, Cert-Targets
+  list          Zonen (mit Herkunft: hestia/mailcow/manuell), Traefik-Configs, Cert-Targets
 
 EINRICHTUNG
   init-config [pfad]

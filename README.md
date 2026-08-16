@@ -228,8 +228,11 @@ dns-mgr watch-certs
 ### Übersicht
 
 ```bash
+# Alle Zonen mit Herkunft ([hestia]/[mailcow]/[manuell]), Traefik-Configs, Cert-Targets:
 dns-mgr list
 ```
+
+Die Herkunft wird aus den Sync-State-Dateien (`hestia-domains.json`, `mailcow-domains.json` in `$STATE_DIR`) abgeleitet: Domains, die per `hestia-sync`/`mailcow-sync` bekannt sind, werden entsprechend markiert — alles andere gilt als `manuell` (z.B. per `add-service` angelegt).
 
 ---
 

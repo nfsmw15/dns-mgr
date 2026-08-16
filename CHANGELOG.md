@@ -5,6 +5,11 @@ Alle wichtigen Änderungen an dns-mgr werden in dieser Datei dokumentiert.
 Das Format basiert auf [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 das Projekt folgt [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-08-16
+
+### Hinzugefügt
+- `list`: Jede PowerDNS-Zone wird jetzt mit ihrer Herkunft markiert (`[hestia]`, `[mailcow]`, `[hestia+mailcow]` oder `[manuell]`), abgeleitet aus den Sync-State-Dateien `hestia-domains.json`/`mailcow-domains.json`. Beantwortet die Frage "wurde dieser Eintrag automatisch von hestia-sync/mailcow-sync angelegt oder manuell per add-web/add-service?" ohne die State-Dateien von Hand durchsuchen zu müssen — gleichzeitig die zentrale Anlaufstelle, um überhaupt erst zu sehen welche Domains es gibt (Voraussetzung für `edit <domain>`).
+
 ## [0.7.0] - 2026-08-16
 
 ### Hinzugefügt
