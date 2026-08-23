@@ -19,7 +19,7 @@
 # Ort:    /usr/local/bin/dns-mgr  (LXC 120 / Traefik)
 # Rechte: chmod 750, chown root:root
 #
-# Version: 0.7.1
+# Version: 0.7.2
 # Abhängigkeiten: curl, jq, openssl, inotifywait (inotify-tools), ssh, scp
 # =============================================================================
 set -euo pipefail
@@ -703,10 +703,16 @@ pfsense_configured() {
 
 pfsense_exec_php() {
   # Führt PHP-Code auf pfSense via XML-RPC (pfsense.exec_php) aus.
+  # Auth läuft über HTTP Basic Auth: pfSenses server-seitige auth()-Methode
+  # liest ausschließlich $_SERVER['PHP_AUTH_USER']/PHP_AUTH_PW, keine
+  # XML-RPC-Parameter — und exec_php() nimmt server-seitig genau EINEN
+  # Parameter entgegen (den PHP-Code). Bestätigt gegen pfSenses eigenen
+  # xmlrpc_client.inc (baut die URL als https://user:pass@host/xmlrpc.php).
   # Gibt die vom PHP-Code per echo ausgegebene Zeichenkette zurück.
   local php_code="$1"
   local result
   result=$(curl -sf -k -X POST \
+    -u "${PFSENSE_USER}:${PFSENSE_PASS}" \
     -H "Content-Type: text/xml" \
     --data-binary @- \
     "https://${PFSENSE_HOST}/xmlrpc.php" 2>/dev/null <<XMLEOF
@@ -714,15 +720,16 @@ pfsense_exec_php() {
 <methodCall>
   <methodName>pfsense.exec_php</methodName>
   <params>
-    <param><value><string><![CDATA[${PFSENSE_USER}]]></string></value></param>
-    <param><value><string><![CDATA[${PFSENSE_PASS}]]></string></value></param>
     <param><value><string><![CDATA[${php_code}]]></string></value></param>
   </params>
 </methodCall>
 XMLEOF
   ) || return 1
-  # Ausgabe aus XML-RPC Antwort extrahieren
-  echo "$result" | grep -oP '(?<=<string>)[^<]+'
+  # pfSense hängt die vom PHP-Code per echo ausgegebene Ausgabe UNVERPACKT vor
+  # die eigentliche XML-RPC-Antwort (kein <string>-Element im methodResponse,
+  # da $toreturn nicht gesetzt wird) — daher hier alles ab dem XML-Prolog
+  # abschneiden statt (wie zuvor, wirkungslos) nach <string> zu grep-en.
+  echo "${result%%<\?xml*}"
 }
 
 pfsense_set_override() {

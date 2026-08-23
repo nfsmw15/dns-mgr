@@ -5,6 +5,13 @@ Alle wichtigen Änderungen an dns-mgr werden in dieser Datei dokumentiert.
 Das Format basiert auf [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 das Projekt folgt [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-08-23
+
+### Behoben
+- **pfSense Split-DNS: XML-RPC-Auth funktionierte nie.** `pfsense_exec_php()` schickte Benutzername/Passwort als zusätzliche XML-RPC-Parameter — pfSenses server-seitige `auth()`-Methode liest Zugangsdaten aber ausschließlich aus HTTP-Basic-Auth-Headern (`$_SERVER['PHP_AUTH_USER']`/`PHP_AUTH_PW`), niemals aus XML-RPC-Parametern. `exec_php()` nimmt server-seitig zudem nur genau einen Parameter entgegen (den PHP-Code), nicht drei. Jeder Aufruf schlug dadurch unabhängig von den Zugangsdaten mit "Authentication failed: Invalid username or password" fehl — bestätigt gegen pfSenses eigenen `xmlrpc_client.inc` (baut die Request-URL als `https://user:pass@host/xmlrpc.php`). Fix: `curl -u "${PFSENSE_USER}:${PFSENSE_PASS}"` für Basic Auth, nur noch der PHP-Code als einziger `<param>`.
+- **pfSense Split-DNS: Erfolgsantworten wurden als Fehler gemeldet.** Die von pfSense per `echo` im PHP-Code ausgegebene Antwort (z.B. `'ok'`, `'deleted'`, JSON) landet unverpackt VOR dem eigentlichen `<methodResponse>` in der HTTP-Antwort, nicht in einem `<string>`-Element darin (da `$toreturn` nicht gesetzt wird). Die bisherige Extraktion (`grep -oP '(?<=<string>)[^<]+'`) fand dadurch nie etwas, wodurch `pfsense_set_override`/`pfsense_delete_override`/`sync-split-dns` selbst bei technisch erfolgreichem Aufruf immer eine leere Antwort sahen und "fehlgeschlagen" loggten — obwohl der Override serverseitig korrekt gesetzt wurde. Fix: Antwort ab dem XML-Prolog (`<?xml...`) abschneiden statt nach `<string>` zu suchen.
+- Beide Bugs wurden nie in echtem Betrieb bemerkt, da die pfSense-Integration bis dato nicht aktiv genutzt wurde — beim ersten Live-Test aufgefallen und gegen pfSenses eigenen Quellcode (`xmlrpc.php`, `xmlrpc_client.inc`) verifiziert.
+
 ## [0.7.1] - 2026-08-16
 
 ### Hinzugefügt
