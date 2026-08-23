@@ -19,7 +19,7 @@
 # Ort:    /usr/local/bin/dns-mgr  (LXC 120 / Traefik)
 # Rechte: chmod 750, chown root:root
 #
-# Version: 0.7.4
+# Version: 0.7.5
 # Abhängigkeiten: curl, jq, openssl, inotifywait (inotify-tools), ssh, scp
 # =============================================================================
 set -euo pipefail
@@ -746,7 +746,7 @@ pfsense_set_override() {
 if(!is_array(\$config['unbound']['hosts'])){\$config['unbound']['hosts']=array();}
 \$found=false;
 foreach(\$config['unbound']['hosts'] as \$k=>\$hh){
-  if(\$hh['host']===\$h&&\$hh['domain']===\$d){\$config['unbound']['hosts'][\$k]['ip']=\$ip;\$found=true;break;}
+  if((isset(\$hh['host'])?\$hh['host']:'')===\$h&&\$hh['domain']===\$d){\$config['unbound']['hosts'][\$k]['ip']=\$ip;\$found=true;break;}
 }
 if(!\$found){\$config['unbound']['hosts'][]=array('host'=>\$h,'domain'=>\$d,'ip'=>\$ip,'descr'=>\$desc,'aliases'=>array());}
 write_config('dns-mgr');
@@ -777,7 +777,7 @@ pfsense_delete_override() {
 \$deleted=false;
 if(is_array(\$config['unbound']['hosts'])){
   foreach(\$config['unbound']['hosts'] as \$k=>\$hh){
-    if(\$hh['host']===\$h&&\$hh['domain']===\$d){unset(\$config['unbound']['hosts'][\$k]);\$deleted=true;}
+    if((isset(\$hh['host'])?\$hh['host']:'')===\$h&&\$hh['domain']===\$d){unset(\$config['unbound']['hosts'][\$k]);\$deleted=true;}
   }
   \$config['unbound']['hosts']=array_values(\$config['unbound']['hosts']);
 }
@@ -1952,7 +1952,7 @@ echo json_encode(\$out);"
 if(!is_array(\$config['unbound']['hosts'])){\$config['unbound']['hosts']=array();}
 \$found=false;
 foreach(\$config['unbound']['hosts'] as \$k=>\$hh){
-  if(\$hh['host']===\$h&&\$hh['domain']===\$d){\$config['unbound']['hosts'][\$k]['ip']=\$ip;\$found=true;break;}
+  if((isset(\$hh['host'])?\$hh['host']:'')===\$h&&\$hh['domain']===\$d){\$config['unbound']['hosts'][\$k]['ip']=\$ip;\$found=true;break;}
 }
 if(!\$found){\$config['unbound']['hosts'][]=array('host'=>\$h,'domain'=>\$d,'ip'=>\$ip,'descr'=>\$desc,'aliases'=>array());}
 write_config('dns-mgr');
@@ -1977,7 +1977,7 @@ echo 'ok';"
 \$deleted=false;
 if(is_array(\$config['unbound']['hosts'])){
   foreach(\$config['unbound']['hosts'] as \$k=>\$hh){
-    if(\$hh['host']===\$h&&\$hh['domain']===\$d){unset(\$config['unbound']['hosts'][\$k]);\$deleted=true;}
+    if((isset(\$hh['host'])?\$hh['host']:'')===\$h&&\$hh['domain']===\$d){unset(\$config['unbound']['hosts'][\$k]);\$deleted=true;}
   }
   \$config['unbound']['hosts']=array_values(\$config['unbound']['hosts']);
 }

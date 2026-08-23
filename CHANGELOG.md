@@ -5,6 +5,11 @@ Alle wichtigen Änderungen an dns-mgr werden in dieser Datei dokumentiert.
 Das Format basiert auf [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 das Projekt folgt [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.5] - 2026-08-23
+
+### Behoben
+- **`sync-split-dns` duplizierte statt zu aktualisieren, wenn ein bestehender Override kein `host`-Array-Element gesetzt hat.** Manuell über die pfSense-GUI angelegte Overrides mit leerem Host-Feld (typisch für Domain-weite Overrides ohne Subdomain) speichern das `host`-Element offenbar teils gar nicht (statt eines leeren Strings) — `$hh['host']` liefert dann `null`. Der PHP-Abgleich beim Setzen/Löschen nutzte strikten Vergleich `$hh['host']===$h` mit `$h=''`; `null === ''` ist in PHP `false`, wodurch der bestehende Eintrag nie gefunden und stattdessen ein zweiter, widersprüchlicher Override mit gleichem Host+Domain aber neuer IP angelegt wurde. Im Live-Betrieb reproduziert: `sync-split-dns` duplizierte 4 zuvor manuell angelegte Domain-Overrides statt sie zu aktualisieren. Fix: `(isset(\$hh['host'])?\$hh['host']:'')===\$h` statt `\$hh['host']===\$h` in allen vier betroffenen `foreach`-Abgleichen (`pfsense_set_override`, `pfsense_delete_override`, sowie `set_php`/`del_php` in `sync-split-dns`).
+
 ## [0.7.4] - 2026-08-23
 
 ### Behoben
