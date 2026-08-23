@@ -5,6 +5,11 @@ Alle wichtigen Änderungen an dns-mgr werden in dieser Datei dokumentiert.
 Das Format basiert auf [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 das Projekt folgt [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.4] - 2026-08-23
+
+### Behoben
+- **`sync-split-dns` brach kommentarlos ab, sobald `TRAEFIK_CONF_DIR` eine Config ohne `url:`-Zeile enthielt** (z.B. `hsts.yml`, das reine Middleware-Definitionen ohne Backend enthält). Die Backend-IP-Extraktion (`grep ... | head -1 | grep ... | head -1`) lieferte in dem Fall keinen Treffer, wodurch die Pipeline unter `set -euo pipefail` einen Exit-Code ungleich 0 zurückgab — als eigenständige Zuweisung (kein `local var=$(...)`, sondern separates `local var; var=$(...)`) beendete das unter `set -e` sofort das ganze Script, ohne jede Fehlermeldung. Der identische Grep zwei Zeilen weiter unten hatte bereits ein absicherndes `|| true`, dieser hier war schlicht übersehen worden. Fix: `|| true` ergänzt.
+
 ## [0.7.3] - 2026-08-23
 
 ### Behoben

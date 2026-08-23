@@ -19,7 +19,7 @@
 # Ort:    /usr/local/bin/dns-mgr  (LXC 120 / Traefik)
 # Rechte: chmod 750, chown root:root
 #
-# Version: 0.7.3
+# Version: 0.7.4
 # Abhängigkeiten: curl, jq, openssl, inotifywait (inotify-tools), ssh, scp
 # =============================================================================
 set -euo pipefail
@@ -1897,7 +1897,7 @@ cmd_sync_split_dns() {
     [[ -f "$yml" ]] || continue
     local backend_ip
     backend_ip=$(grep -oP 'url: "?\K[^"]+' "$yml" 2>/dev/null \
-      | head -1 | grep -oP '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+      | head -1 | grep -oP '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
     [[ -z "$backend_ip" ]] && continue
     while IFS= read -r fqdn; do
       [[ -z "$fqdn" ]] && continue
