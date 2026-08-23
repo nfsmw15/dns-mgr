@@ -5,6 +5,12 @@ Alle wichtigen Änderungen an dns-mgr werden in dieser Datei dokumentiert.
 Das Format basiert auf [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 das Projekt folgt [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.3] - 2026-08-23
+
+### Behoben
+- **pfSense Split-DNS: Overrides wurden nie tatsächlich gespeichert.** Alle sechs `exec_php`-PHP-Snippets (`pfsense_set_override`, `pfsense_delete_override`, sowie `list_php`/`set_php`/`del_php` in `sync-split-dns` und `list_php` in `list-split-dns`) griffen auf `$config` zu, ohne es per `global $config;` zu importieren. `eval()` läuft innerhalb der `exec_php()`-Methode der pfSense-Server-Klasse — ohne `global $config;` erzeugt PHP dadurch eine rein lokale, für den Aufruf isolierte Kopie: der PHP-Code lief fehlerfrei durch und meldete `'ok'`, aber `write_config()` sah nach wie vor den unveränderten echten globalen `$config` und schrieb die Änderung nie weg. Ein `add-service`-Aufruf meldete dadurch "erfolgreich gesetzt", aber `list-split-dns` zeigte danach weiterhin 0 Einträge. Per lokalem PHP-Test verifiziert (`eval()`-Scoping-Verhalten innerhalb einer Klassenmethode) und im Live-Test gegen echtes pfSense bestätigt. Fix: `global \$config;` an den Anfang jedes betroffenen Snippets.
+- Damit sind jetzt alle drei aufeinanderfolgenden Bugs behoben, die die pfSense-Integration seit Einführung komplett unbenutzbar gemacht hatten (siehe auch 0.7.2: Auth-Mechanismus und Response-Parsing).
+
 ## [0.7.2] - 2026-08-23
 
 ### Behoben

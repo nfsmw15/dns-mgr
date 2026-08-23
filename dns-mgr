@@ -19,7 +19,7 @@
 # Ort:    /usr/local/bin/dns-mgr  (LXC 120 / Traefik)
 # Rechte: chmod 750, chown root:root
 #
-# Version: 0.7.2
+# Version: 0.7.3
 # Abhängigkeiten: curl, jq, openssl, inotifywait (inotify-tools), ssh, scp
 # =============================================================================
 set -euo pipefail
@@ -741,7 +741,7 @@ pfsense_set_override() {
   [[ "$fqdn" == "$zone" ]] && host_part="" || host_part="${fqdn%.${zone}}"
   domain_part="$zone"
 
-  local php_code="require_once('unbound.inc');
+  local php_code="global \$config; require_once('unbound.inc');
 \$h='${host_part}'; \$d='${domain_part}'; \$ip='${ip}'; \$desc='dns-mgr: ${fqdn}';
 if(!is_array(\$config['unbound']['hosts'])){\$config['unbound']['hosts']=array();}
 \$found=false;
@@ -772,7 +772,7 @@ pfsense_delete_override() {
   [[ "$fqdn" == "$zone" ]] && host_part="" || host_part="${fqdn%.${zone}}"
   domain_part="$zone"
 
-  local php_code="require_once('unbound.inc');
+  local php_code="global \$config; require_once('unbound.inc');
 \$h='${host_part}'; \$d='${domain_part}';
 \$deleted=false;
 if(is_array(\$config['unbound']['hosts'])){
@@ -1917,7 +1917,7 @@ cmd_sync_split_dns() {
   log "Domains in Traefik-Configs: ${#desired[@]}"
 
   # Bestehende pfSense Overrides einmalig laden
-  local list_php="\$out=array();
+  local list_php="global \$config; \$out=array();
 if(is_array(\$config['unbound']['hosts'])){
   foreach(\$config['unbound']['hosts'] as \$k=>\$h){
     \$out[]=array('id'=>\$k,'host'=>isset(\$h['host'])?\$h['host']:'','domain'=>isset(\$h['domain'])?\$h['domain']:'','ip'=>isset(\$h['ip'])?\$h['ip']:'','descr'=>isset(\$h['descr'])?\$h['descr']:'');
@@ -1947,7 +1947,7 @@ echo json_encode(\$out);"
       continue
     fi
 
-    local set_php="require_once('unbound.inc');
+    local set_php="global \$config; require_once('unbound.inc');
 \$h='${h}'; \$d='${d}'; \$ip='${ip}'; \$desc='dns-mgr: ${h:+$h.}${d}';
 if(!is_array(\$config['unbound']['hosts'])){\$config['unbound']['hosts']=array();}
 \$found=false;
@@ -1972,7 +1972,7 @@ echo 'ok';"
     [[ -z "$oh" && -z "$od" ]] && continue
     local key="${oh}|${od}"
     if [[ -z "${desired[$key]+x}" ]]; then
-      local del_php="require_once('unbound.inc');
+      local del_php="global \$config; require_once('unbound.inc');
 \$h='${oh}'; \$d='${od}';
 \$deleted=false;
 if(is_array(\$config['unbound']['hosts'])){
@@ -2012,7 +2012,7 @@ cmd_list_split_dns() {
   pfsense_configured \
     || die "Split-DNS nicht konfiguriert — PFSENSE_HOST, PFSENSE_USER, PFSENSE_PASS in dns-mgr.conf setzen"
 
-  local list_php="\$out=array();
+  local list_php="global \$config; \$out=array();
 if(is_array(\$config['unbound']['hosts'])){
   foreach(\$config['unbound']['hosts'] as \$k=>\$h){
     \$out[]=array('host'=>isset(\$h['host'])?\$h['host']:'','domain'=>isset(\$h['domain'])?\$h['domain']:'','ip'=>isset(\$h['ip'])?\$h['ip']:'','descr'=>isset(\$h['descr'])?\$h['descr']:'');
