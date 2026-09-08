@@ -118,6 +118,24 @@ HSTS_MAX_AGE=""           # leer = HSTS deaktiviert
 HSTS_SUBDOMAINS=0         # 1 = includeSubDomains (nur wenn ALLE Subdomains HTTPS)
 HSTS_PRELOAD=0            # 1 = Preload-List (VORSICHT: quasi unwiderruflich)
 
+# ── Benachrichtigungen (optional) ─────────────────────────────────────────────
+# Für Ereignisse aus unbeaufsichtigten Cron-Läufen (hestia-sync,
+# sync-split-dns): nicht erreichbare Backends, automatisch gelöschte Zonen,
+# verwaiste Traefik-Configs. Alle Kanäle sind unabhängig voneinander —
+# leer lassen = Kanal deaktiviert, mehrere gesetzt = alle werden benutzt.
+NTFY_URL=""               # z.B. https://ntfy.sh/mein-topic oder eigene Instanz
+NTFY_TOKEN=""             # optional, Bearer-Token für geschützte ntfy-Topics
+
+NOTIFY_MAIL_TO=""         # Empfänger-Adresse
+NOTIFY_MAIL_FROM=""       # Absender-Adresse
+NOTIFY_SMTP_URL=""        # z.B. smtps://mail.DEINE-DOMAIN.tld:465
+NOTIFY_SMTP_USER=""
+NOTIFY_SMTP_PASS=""
+
+MATRIX_HOMESERVER=""      # z.B. https://matrix.DEINE-DOMAIN.tld
+MATRIX_TOKEN=""           # Access-Token eines Bot-Accounts
+MATRIX_ROOM_ID=""         # z.B. !AbCdEfGhIjKlMnOp:DEINE-DOMAIN.tld
+
 # ── State-Verzeichnis ─────────────────────────────────────────────────────────
 # Hier speichert dns-mgr bekannte Domains (für hestia-sync, mailcow-sync)
 # und MTA-STS IDs pro Domain (darf sich nur bei Policy-Änderung ändern).

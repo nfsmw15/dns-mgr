@@ -283,6 +283,43 @@ dns-mgr remove pve.nfsmw15.de
 
 ---
 
+## Benachrichtigungen
+
+`hestia-sync` und `sync-split-dns` laufen unbeaufsichtigt per Cron — Fehler oder automatische Aufräumaktionen darin bleiben sonst nur in Log-Dateien stehen, die niemand regelmäßig anschaut. Optional lassen sich mehrere Kanäle gleichzeitig aktivieren:
+
+```bash
+# In /etc/dns-mgr/dns-mgr.conf:
+NTFY_URL="https://ntfy.sh/mein-geheimes-topic"   # besser: eigene ntfy-Instanz statt ntfy.sh —
+NTFY_TOKEN=""                                     # Topics auf ntfy.sh sind ohne Auth für jeden
+                                                   # lesbar UND beschreibbar, der den Namen kennt
+
+NOTIFY_MAIL_TO="admin@nfsmw15.de"
+NOTIFY_MAIL_FROM="dns-mgr@nfsmw15.de"
+NOTIFY_SMTP_URL="smtps://mail.nfsmw15.de:465"     # z.B. die eigene Mailcow
+NOTIFY_SMTP_USER="dns-mgr@nfsmw15.de"
+NOTIFY_SMTP_PASS="..."
+
+MATRIX_HOMESERVER="https://matrix.nfsmw15.de"     # eigener Homeserver
+MATRIX_TOKEN="..."                                # Access-Token eines Bot-Accounts
+MATRIX_ROOM_ID="!AbCdEfGhIjKlMnOp:nfsmw15.de"
+```
+
+Jedes Feld leer lassen deaktiviert den jeweiligen Kanal — ganz ohne Konfiguration bleibt dns-mgr wie bisher stumm (nur Logs).
+
+Ausgelöst wird eine Benachrichtigung bei:
+- nicht erreichbaren Backends in `hestia-sync`/`sync-split-dns` (HestiaCP, pfSense),
+- einer per `hestia-sync` automatisch gelöschten PowerDNS-Zone (siehe unten),
+- einer Traefik-`Host()`-Regel ohne zugehörige PowerDNS-Zone (verwaiste Config) — pro Domain nur einmalig, bis sie verschwindet und erneut auftaucht.
+
+### Automatisches Aufräumen bei entfernten HestiaCP-Domains
+
+Wird eine Domain in HestiaCP gelöscht, räumt `hestia-sync` automatisch auf:
+- Traefik-Config und pfSense-Split-DNS-Override werden immer entfernt.
+- War die Domain eine Subdomain einer geteilten Zone, werden nur ihre eigenen A/AAAA-Records (+`www.`) gelöscht — Mail-Records (`mail.*`, MX, …) sind davon nie betroffen.
+- War die Domain selbst eine eigene PowerDNS-Zone, wird die komplette Zone gelöscht — aber **nur wenn kein MX-Record mehr existiert**. Ist noch Mail konfiguriert, bleibt die Zone erhalten.
+
+---
+
 ## HSTS
 
 HTTP Strict Transport Security — Browser merken sich dass eine Domain immer nur über HTTPS erreichbar ist und überspringen den HTTP-Schritt komplett.

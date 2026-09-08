@@ -19,7 +19,7 @@
 # Ort:    /usr/local/bin/dns-mgr  (LXC 120 / Traefik)
 # Rechte: chmod 750, chown root:root
 #
-# Version: 0.7.5
+# Version: 0.8.0
 # Abhängigkeiten: curl, jq, openssl, inotifywait (inotify-tools), ssh, scp
 # =============================================================================
 set -euo pipefail
@@ -67,6 +67,22 @@ HSTS_MAX_AGE=""
 HSTS_SUBDOMAINS=0   # 1 = includeSubDomains (nur wenn ALLE Subdomains HTTPS haben)
 HSTS_PRELOAD=0      # 1 = Preload-List Eintrag (VORSICHT: quasi unwiderruflich)
 
+# ── Benachrichtigungen (optional) ─────────────────────────────────────────────
+# Alle Kanäle sind unabhängig voneinander — leer lassen = Kanal deaktiviert,
+# mehrere gleichzeitig gesetzt = alle werden benutzt.
+NTFY_URL=""          # z.B. https://ntfy.sh/mein-topic oder eigene Instanz
+NTFY_TOKEN=""        # optional, Bearer-Token für geschützte ntfy-Topics
+
+NOTIFY_MAIL_TO=""     # Empfänger-Adresse
+NOTIFY_MAIL_FROM=""   # Absender-Adresse
+NOTIFY_SMTP_URL=""    # z.B. smtps://mail.DEINE-DOMAIN.tld:465
+NOTIFY_SMTP_USER=""
+NOTIFY_SMTP_PASS=""
+
+MATRIX_HOMESERVER=""  # z.B. https://matrix.DEINE-DOMAIN.tld
+MATRIX_TOKEN=""       # Access-Token eines Bot-Accounts
+MATRIX_ROOM_ID=""     # z.B. !AbCdEfGhIjKlMnOp:DEINE-DOMAIN.tld
+
 STATE_DIR="/var/lib/dns-mgr"
 
 # Config laden
@@ -89,6 +105,7 @@ HESTIA_API="https://${HESTIA_IP}:8083/api/"
 MAILCOW_STATE="${STATE_DIR}/mailcow-domains.json"
 HESTIA_STATE="${STATE_DIR}/hestia-domains.json"
 MTA_STS_STATE="${STATE_DIR}/mta-sts-ids.json"
+SPLIT_DNS_ORPHAN_STATE="${STATE_DIR}/split-dns-orphans"
 
 ### ═══════════════════════════════════════════════════════════════════════════
 ### HILFSFUNKTIONEN
@@ -98,6 +115,51 @@ log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 info() { echo "[$(date '+%Y-%m-%d %H:%M:%S')]   → $*"; }
 warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNUNG: $*" >&2; }
 die()  { echo "FEHLER: $*" >&2; exit 1; }
+
+notify() {
+  # notify <betreff> <nachricht> — best effort, bricht nie mit Fehler ab.
+  # Wird ausschließlich für Ereignisse aus unbeaufsichtigten Cron-Läufen
+  # (hestia-sync, sync-split-dns) benutzt, nicht für interaktive Kommandos.
+  local subject="$1" message="$2"
+
+  if [[ -n "${NTFY_URL:-}" ]]; then
+    local -a ntfy_opts=(-sf -X POST -H "Title: ${subject}" --data-binary "$message")
+    [[ -n "${NTFY_TOKEN:-}" ]] && ntfy_opts+=(-H "Authorization: Bearer ${NTFY_TOKEN}")
+    curl "${ntfy_opts[@]}" "$NTFY_URL" >/dev/null 2>&1 \
+      || warn "ntfy-Benachrichtigung fehlgeschlagen: ${subject}"
+  fi
+
+  if [[ -n "${NOTIFY_SMTP_URL:-}" && -n "${NOTIFY_MAIL_TO:-}" ]]; then
+    local -a smtp_opts=(-sf --url "$NOTIFY_SMTP_URL" \
+      --mail-from "$NOTIFY_MAIL_FROM" --mail-rcpt "$NOTIFY_MAIL_TO" --upload-file -)
+    [[ -n "${NOTIFY_SMTP_USER:-}" ]] && smtp_opts+=(--user "${NOTIFY_SMTP_USER}:${NOTIFY_SMTP_PASS}")
+    printf 'Subject: %s\r\nFrom: %s\r\nTo: %s\r\n\r\n%s\r\n' \
+        "$subject" "$NOTIFY_MAIL_FROM" "$NOTIFY_MAIL_TO" "$message" \
+      | curl "${smtp_opts[@]}" >/dev/null 2>&1 \
+      || warn "E-Mail-Benachrichtigung fehlgeschlagen: ${subject}"
+  fi
+
+  if [[ -n "${MATRIX_HOMESERVER:-}" && -n "${MATRIX_TOKEN:-}" && -n "${MATRIX_ROOM_ID:-}" ]]; then
+    local txn_id="dnsmgr-$(date +%s%N)-${RANDOM}"
+    local matrix_body
+    matrix_body=$(jq -n --arg body "${subject}: ${message}" '{msgtype: "m.text", body: $body}')
+    curl -sf -X PUT \
+      -H "Authorization: Bearer ${MATRIX_TOKEN}" \
+      -H "Content-Type: application/json" \
+      -d "$matrix_body" \
+      "${MATRIX_HOMESERVER}/_matrix/client/v3/rooms/${MATRIX_ROOM_ID}/send/m.room.message/${txn_id}" \
+      >/dev/null 2>&1 \
+      || warn "Matrix-Benachrichtigung fehlgeschlagen: ${subject}"
+  fi
+
+  return 0
+}
+
+die_notify() {
+  # die_notify <betreff> <nachricht> — wie die(), schickt aber vorher notify()
+  notify "$1" "$2"
+  die "$2"
+}
 
 ipv6_addr()      { echo "${IPV6_PREFIX}${1}"; }
 ipv6_from_ctid() { ipv6_addr "::${1}"; }
@@ -139,6 +201,13 @@ pdns_delete_zone() {
 
 zone_exists() {
   pdns_get "/servers/localhost/zones/${1}." 2>/dev/null | grep -q '"id"'
+}
+
+zone_has_mx() {
+  # Prüft, ob eine Zone (noch) einen MX-Record trägt — der zuverlässige
+  # Indikator dafür, dass für die Domain aktiv Mail konfiguriert ist.
+  pdns_get "/servers/localhost/zones/${1}." 2>/dev/null \
+    | jq -e '.rrsets[]? | select(.type == "MX")' >/dev/null 2>&1
 }
 
 get_zone_for_domain() {
@@ -1622,15 +1691,15 @@ cmd_hestia_sync() {
   hc_body="${hc_response%$'\n'*}"
 
   case "$hc_code" in
-    000) die "HestiaCP nicht erreichbar (${HESTIA_IP}) — LXC online?" ;;
+    000) die_notify "dns-mgr: hestia-sync fehlgeschlagen" "HestiaCP nicht erreichbar (${HESTIA_IP}) — LXC online?" ;;
     200) : ;;
-    *)   die "HestiaCP-API HTTP ${hc_code} — Keys und IP-Whitelist prüfen (Einstellungen → Sicherheit)" ;;
+    *)   die_notify "dns-mgr: hestia-sync fehlgeschlagen" "HestiaCP-API HTTP ${hc_code} — Keys und IP-Whitelist prüfen (Einstellungen → Sicherheit)" ;;
   esac
 
   # Alle User abrufen
   local all_users
   all_users=$(echo "$hc_body" | jq -r 'keys[]' 2>/dev/null) \
-    || die "HestiaCP-API: ungültige Antwort"
+    || die_notify "dns-mgr: hestia-sync fehlgeschlagen" "HestiaCP-API: ungültige Antwort"
 
   # Aktuelle Domains als JSON: { "user": ["domain1", "domain2"], ... }
   local current_json="{}"
@@ -1684,9 +1753,40 @@ cmd_hestia_sync() {
       domain="${line%% *}"
       huser="${line##* }"
       log "Domain aus HestiaCP entfernt: ${domain} (User: ${huser})"
-      # Nur Traefik-Config entfernen, Zone bleibt (könnte noch Mail haben)
       remove_traefik_config "$(safe_name "$domain")"
-      log "Traefik-Config fuer ${domain} entfernt (Zone bleibt erhalten)"
+      if pfsense_configured; then
+        local rm_zone; rm_zone=$(get_zone_for_domain "$domain")
+        [[ -z "$rm_zone" ]] && rm_zone="$domain"
+        pfsense_delete_override "$domain" "$rm_zone"
+      fi
+
+      # DNS aufräumen: eigene A/AAAA(+www)-Records der Domain betreffen nie
+      # Mail (liegt auf eigenen Namen: mail.*, autoconfig.*, MX bei @). Ist die
+      # Domain selbst eine dedizierte Zone, wird die komplette Zone gelöscht,
+      # aber nur wenn kein MX-Record (mehr) existiert — sonst bleibt sie erhalten.
+      local zone; zone=$(get_zone_for_domain "$domain")
+      if [[ -z "$zone" ]]; then
+        : # keine Zone (mehr) vorhanden
+      elif [[ "$domain" == "$zone" ]]; then
+        if zone_has_mx "$zone"; then
+          log "Zone ${zone} hat weiterhin einen MX-Record — bleibt erhalten"
+        elif pdns_delete_zone "$zone" >/dev/null 2>&1; then
+          log "Zone ${zone} gelöscht (kein MX-Record mehr vorhanden)"
+          notify "dns-mgr: Zone automatisch gelöscht" \
+            "Zone ${zone} wurde gelöscht — Domain wurde in HestiaCP entfernt und hatte keinen MX-Record mehr."
+        else
+          warn "Zone ${zone} konnte nicht gelöscht werden"
+        fi
+      else
+        local sub="${domain%.${zone}}"
+        delete_record "$zone" "$sub" "A"
+        delete_record "$zone" "$sub" "AAAA"
+        delete_record "$zone" "www.${sub}" "A"
+        delete_record "$zone" "www.${sub}" "AAAA"
+        log "DNS-Records fuer ${domain} entfernt (Zone ${zone} bleibt erhalten)"
+      fi
+
+      log "Aufräumen fuer ${domain} abgeschlossen"
       changed=1
     done <<< "$removed_domains"
   fi
@@ -1804,6 +1904,24 @@ HSTS_MAX_AGE=""           # Sekunden (300 = Test, 31536000 = Produktion)
 HSTS_SUBDOMAINS=0         # 1 = includeSubDomains
 HSTS_PRELOAD=0            # 1 = Preload (VORSICHT: quasi unwiderruflich)
 
+# ── Benachrichtigungen (optional) ─────────────────────────────────────────────
+# Fuer Ereignisse aus unbeaufsichtigten Cron-Laeufen (hestia-sync,
+# sync-split-dns): nicht erreichbare Backends, automatisch geloeschte Zonen,
+# verwaiste Traefik-Configs. Alle Kanaele sind unabhaengig voneinander —
+# leer lassen = Kanal deaktiviert, mehrere gesetzt = alle werden benutzt.
+NTFY_URL=""               # z.B. https://ntfy.sh/mein-topic oder eigene Instanz
+NTFY_TOKEN=""             # optional, Bearer-Token fuer geschuetzte ntfy-Topics
+
+NOTIFY_MAIL_TO=""         # Empfaenger-Adresse
+NOTIFY_MAIL_FROM=""       # Absender-Adresse
+NOTIFY_SMTP_URL=""        # z.B. smtps://mail.DEINE-DOMAIN.tld:465
+NOTIFY_SMTP_USER=""
+NOTIFY_SMTP_PASS=""
+
+MATRIX_HOMESERVER=""      # z.B. https://matrix.DEINE-DOMAIN.tld
+MATRIX_TOKEN=""           # Access-Token eines Bot-Accounts
+MATRIX_ROOM_ID=""         # z.B. !AbCdEfGhIjKlMnOp:DEINE-DOMAIN.tld
+
 # ── State-Verzeichnis ─────────────────────────────────────────────────────────
 # Hier speichert dns-mgr bekannte Domains (fuer hestia-sync, mailcow-sync)
 # und MTA-STS IDs. Normalerweise nicht aendern.
@@ -1888,10 +2006,22 @@ cmd_sync_split_dns() {
   pfsense_configured \
     || die "Split-DNS nicht konfiguriert — PFSENSE_HOST, PFSENSE_USER, PFSENSE_PASS in dns-mgr.conf setzen"
 
+  mkdir -p "$STATE_DIR"
+
   log "Split-DNS Sync: lese Traefik-Configs aus ${TRAEFIK_CONF_DIR}"
 
   # Gewünschte Overrides aus Traefik-Configs: "host_part|domain_part" → "ip"
   local -A desired=()
+
+  # Bereits bekannte verwaiste Hosts (aus vorherigem Lauf) — verhindert, dass
+  # bei jedem Cron-Durchlauf erneut benachrichtigt wird, solange sich nichts
+  # ändert. Meldet sich erneut, sobald der Host verschwindet und neu auftaucht.
+  local -A prev_orphans=() cur_orphans=()
+  if [[ -f "$SPLIT_DNS_ORPHAN_STATE" ]]; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && prev_orphans["$line"]=1
+    done < "$SPLIT_DNS_ORPHAN_STATE"
+  fi
 
   for yml in "${TRAEFIK_CONF_DIR}"/*.yml; do
     [[ -f "$yml" ]] || continue
@@ -1903,9 +2033,11 @@ cmd_sync_split_dns() {
       [[ -z "$fqdn" ]] && continue
       local zone; zone=$(get_zone_for_domain "$fqdn")
       if [[ -z "$zone" ]]; then
-        local -a fparts; IFS='.' read -ra fparts <<< "$fqdn"
-        local fn=${#fparts[@]}
-        [[ $fn -ge 2 ]] && zone="${fparts[$((fn-2))]}.${fparts[$((fn-1))]}" || zone="$fqdn"
+        warn "Split-DNS: ${fqdn} übersprungen — keine aktive PowerDNS-Zone dafür (verwaiste Traefik-Config, Domain ohne TLD oder IP-Host-Regel)"
+        cur_orphans["$fqdn"]=1
+        [[ -z "${prev_orphans[$fqdn]+x}" ]] && notify "dns-mgr: verwaiste Traefik-Config" \
+          "Host \`${fqdn}\` in ${yml} hat keine aktive PowerDNS-Zone — Split-DNS-Override wird übersprungen. Traefik-Config ggf. manuell aufräumen."
+        continue
       fi
       local h d
       [[ "$fqdn" == "$zone" ]] && h="" || h="${fqdn%.${zone}}"
@@ -1913,6 +2045,9 @@ cmd_sync_split_dns() {
       desired["${h}|${d}"]="$backend_ip"
     done < <(grep -oP "Host\(\`\K[^\`]+" "$yml" 2>/dev/null || true)
   done
+
+  : > "$SPLIT_DNS_ORPHAN_STATE"
+  for fqdn in "${!cur_orphans[@]}"; do echo "$fqdn" >> "$SPLIT_DNS_ORPHAN_STATE"; done
 
   log "Domains in Traefik-Configs: ${#desired[@]}"
 
@@ -1927,9 +2062,9 @@ echo json_encode(\$out);"
 
   local existing_json
   existing_json=$(pfsense_exec_php "$list_php") \
-    || die "pfSense nicht erreichbar — Zugangsdaten prüfen"
+    || die_notify "dns-mgr: sync-split-dns fehlgeschlagen" "pfSense nicht erreichbar — Zugangsdaten prüfen"
   [[ -z "$existing_json" || "$existing_json" == "null" ]] && \
-    die "pfSense XML-RPC: keine Antwort — PFSENSE_USER/PFSENSE_PASS prüfen"
+    die_notify "dns-mgr: sync-split-dns fehlgeschlagen" "pfSense XML-RPC: keine Antwort — PFSENSE_USER/PFSENSE_PASS prüfen"
 
   local updated=0 unchanged=0 removed=0
 
@@ -2038,6 +2173,25 @@ echo json_encode(\$out);"
 }
 
 ### ═══════════════════════════════════════════════════════════════════════════
+### KOMMANDO: notify-test
+### Schickt eine Testnachricht über alle konfigurierten Benachrichtigungskanäle
+### ═══════════════════════════════════════════════════════════════════════════
+
+cmd_notify_test() {
+  local configured=()
+  [[ -n "${NTFY_URL:-}" ]] && configured+=("ntfy")
+  [[ -n "${NOTIFY_SMTP_URL:-}" && -n "${NOTIFY_MAIL_TO:-}" ]] && configured+=("E-Mail")
+  [[ -n "${MATRIX_HOMESERVER:-}" && -n "${MATRIX_TOKEN:-}" && -n "${MATRIX_ROOM_ID:-}" ]] && configured+=("Matrix")
+
+  [[ ${#configured[@]} -eq 0 ]] && \
+    die "Kein Benachrichtigungskanal konfiguriert — NTFY_URL, NOTIFY_SMTP_URL/NOTIFY_MAIL_TO oder MATRIX_HOMESERVER/MATRIX_TOKEN/MATRIX_ROOM_ID in dns-mgr.conf setzen"
+
+  log "Sende Testbenachrichtigung über: ${configured[*]}"
+  notify "dns-mgr: Testbenachrichtigung" "Das ist eine Testnachricht von $(hostname) — wenn du das liest, funktioniert der Kanal."
+  log "Testbenachrichtigung abgeschickt — prüfe ntfy/E-Mail/Matrix (Fehler erscheinen als WARNUNG oben)"
+}
+
+### ═══════════════════════════════════════════════════════════════════════════
 ### DISPATCHER
 ### ═══════════════════════════════════════════════════════════════════════════
 
@@ -2061,6 +2215,7 @@ case "${1:-help}" in
   disable-hsts)    cmd_disable_hsts ;;
   sync-split-dns)  shift; cmd_sync_split_dns "$@" ;;
   list-split-dns)  cmd_list_split_dns ;;
+  notify-test)     cmd_notify_test ;;
   init-config)     shift; cmd_init_config "${1:-}" ;;
   help|--help|-h|*)
     cat <<'HELP'
@@ -2168,6 +2323,11 @@ SPLIT-DNS (pfSense Unbound)
 
   list-split-dns
       Zeigt alle aktuellen Unbound Host Overrides in pfSense
+
+BENACHRICHTIGUNGEN
+  notify-test
+      Schickt eine Testnachricht über alle konfigurierten Kanäle
+      (NTFY_URL, NOTIFY_SMTP_URL/NOTIFY_MAIL_TO, MATRIX_HOMESERVER/...)
 
 ÜBERSICHT
   list          Zonen (mit Herkunft: hestia/mailcow/manuell), Traefik-Configs, Cert-Targets
