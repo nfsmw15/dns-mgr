@@ -1,10 +1,12 @@
 # dns-mgr
 
+[🇬🇧 English](README.en.md) · 🇩🇪 Deutsch
+
 **Unified DNS · Traefik · Certificate Management**
 
-A single Bash script that replaces Plesk by automatically connecting HestiaCP, PowerDNS, Traefik and Mailcow — no hooks, no manual configuration.
+Ein einzelnes Bash-Script, das Plesk ersetzt, indem es HestiaCP, PowerDNS, Traefik und Mailcow automatisch miteinander verbindet — ohne Hooks, ohne manuelle Konfiguration.
 
-> **Language:** This tool is primarily documented in German as it targets German-speaking server administrators replacing Plesk. English documentation is planned.
+> **Was brauche ich davon?** Der Kern ist **PowerDNS + Traefik**: `add-service`, `edit`, `add-srv`, `enable-dnssec`, HSTS und Zertifikat-Deployment funktionieren allein damit. **HestiaCP** (`add-web`, `hestia-sync`), **Mailcow** (`add-mail`, `mailcow-sync`) und **pfSense** (Split-DNS) sind optionale Integrationen — wer sie nicht nutzt, lässt die Felder in der Config leer und ruft die zugehörigen Befehle bzw. Cron-Jobs einfach nicht auf. Ohne `PFSENSE_HOST` wird Split-DNS automatisch übersprungen.
 
 ---
 
@@ -53,7 +55,7 @@ Hetzner Secondary DNS + eigener NS2
 - Debian/Ubuntu LXC oder VM
 - PowerDNS Authoritative Server mit MySQL-Backend und API aktiviert
 - Traefik v2+ mit DNS-01 ACME (pdns Provider)
-- HestiaCP mit aktivierter REST-API
+- HestiaCP mit aktivierter REST-API (optional, für automatische Web-Domains)
 - Mailcow (optional, für Mail-Domains)
 
 ### Abhängigkeiten installieren

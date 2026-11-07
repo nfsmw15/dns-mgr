@@ -97,8 +97,8 @@ else
 fi
 
 # Abgeleitete Variablen (nach Config-Load, damit IPs gesetzt sind)
-MAILCOW_API="https://${MAILCOW_IP}/api/v1"
-HESTIA_API="https://${HESTIA_IP}:8083/api/"
+MAILCOW_API="https://${MAILCOW_IP:-}/api/v1"
+HESTIA_API="https://${HESTIA_IP:-}:8083/api/"
 [[ -z "${TRAEFIK_IPV6:-}" && -n "${IPV6_PREFIX:-}" ]] && TRAEFIK_IPV6="${IPV6_PREFIX}::120"
 
 # State-Dateien

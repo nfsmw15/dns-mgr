@@ -5,6 +5,17 @@ Alle wichtigen Änderungen an dns-mgr werden in dieser Datei dokumentiert.
 Das Format basiert auf [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 das Projekt folgt [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Hinzugefügt
+- **Englische Dokumentation** als `README.en.md`, mit Sprachumschalter in beiden READMEs. Dazu ein Hinweis, welche Komponenten zwingend sind (PowerDNS + Traefik) und welche optional (HestiaCP, Mailcow, pfSense).
+
+### Geändert
+- `LICENSE` enthält jetzt den vollständigen, unveränderten AGPL-3.0-Text statt nur des Lizenzhinweises — GitHub erkennt die Lizenz dadurch korrekt (vorher „Other“). Der Copyright-Hinweis steht weiterhin im Script-Header und in der README.
+
+### Behoben
+- Fehlten `MAILCOW_IP` oder `HESTIA_IP` komplett in der Config (statt leer gesetzt), brach das Script wegen `set -u` schon beim Start ab — auch bei Befehlen, die weder HestiaCP noch Mailcow nutzen.
+
 ## [0.8.1] - 2026-11-07
 
 ### Behoben
