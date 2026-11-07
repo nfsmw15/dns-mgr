@@ -181,6 +181,8 @@ dns-mgr edit phpmyadmin.example.com --no-prefix         # Prefix entfernen
 
 # SRV-Record setzen:
 dns-mgr add-srv example.com mumble tcp 0 10 64738 mumble.example.com
+# z.B. TeamSpeak 3 (_ts3._udp.example.com → ts.example.com:9987):
+dns-mgr add-srv example.com ts3 udp 0 5 9987 ts.example.com
 
 # DNSSEC aktivieren (einmalig, gibt DS-Record für den Registrar aus):
 dns-mgr enable-dnssec example.com
@@ -316,7 +318,8 @@ Ausgelöst wird eine Benachrichtigung bei:
 Wird eine Domain in HestiaCP gelöscht, räumt `hestia-sync` automatisch auf:
 - Traefik-Config und pfSense-Split-DNS-Override werden immer entfernt.
 - War die Domain eine Subdomain einer geteilten Zone, werden nur ihre eigenen A/AAAA-Records (+`www.`) gelöscht — Mail-Records (`mail.*`, MX, …) sind davon nie betroffen.
-- War die Domain selbst eine eigene PowerDNS-Zone, wird die komplette Zone gelöscht — aber **nur wenn kein MX-Record mehr existiert**. Ist noch Mail konfiguriert, bleibt die Zone erhalten.
+- War die Domain selbst eine eigene PowerDNS-Zone, wird die komplette Zone gelöscht — aber **nur wenn sie ausschließlich die von `add-web` angelegten Records enthält** (SOA/NS, A/AAAA am Apex und `www`). Gibt es weitere Records (MX, SRV, TXT, andere Subdomains, …), werden nur die Web-Records entfernt und die Zone bleibt erhalten.
+- Kann HestiaCP die Domains eines Users nicht liefern (Timeout, Fehlerantwort), gilt der bisherige Stand weiter — ein kurzer Aussetzer führt nicht mehr dazu, dass Domains als gelöscht behandelt werden.
 
 ---
 

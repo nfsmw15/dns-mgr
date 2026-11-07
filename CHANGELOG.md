@@ -5,6 +5,12 @@ Alle wichtigen Änderungen an dns-mgr werden in dieser Datei dokumentiert.
 Das Format basiert auf [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 das Projekt folgt [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] - 2026-11-07
+
+### Behoben
+- **`hestia-sync` löschte Zonen, obwohl in HestiaCP nichts entfernt wurde.** Lieferte `v-list-web-domains` für einen User kurzzeitig keine gültige Antwort (Timeout, laufendes Hestia-Backup, Fehlertext statt JSON), landete der User mit leerer Domainliste (bzw. per `|| continue` gar nicht) im aktuellen Stand — alle seine Domains galten als entfernt. Folge: Traefik-Configs und pfSense-Overrides gelöscht, dedizierte Zonen ohne MX komplett gelöscht und im nächsten Lauf (5 min später) leer neu angelegt, wobei manuell gesetzte Records (SRV, TXT, …) verloren gingen. Live mehrfach aufgetreten (u.a. `alexstrasza.org` am 2026-10-09 und 2026-10-22). Fix: Antwort wird jetzt auf HTTP 200 und ein JSON-Objekt geprüft; schlägt das fehl, werden die zuletzt bekannten Domains des Users übernommen. Zusätzlich bricht der Sync bei leerer Userliste ab.
+- **Automatisches Löschen einer dedizierten Zone ist deutlich strenger.** Statt nur auf MX-Records zu prüfen, wird die Zone nur noch gelöscht, wenn sie ausschließlich die von `add-web` angelegten Records enthält (SOA/NS am Apex, A/AAAA am Apex und `www`). Andernfalls werden nur diese Web-Records entfernt und die Zone mit SRV-, TXT-, Subdomain- und Mail-Records bleibt erhalten. `zone_has_mx` wurde dafür durch `zone_foreign_records` ersetzt.
+
 ## [0.8.0] - 2026-09-08
 
 ### Hinzugefügt

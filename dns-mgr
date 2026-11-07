@@ -19,7 +19,7 @@
 # Ort:    /usr/local/bin/dns-mgr  (LXC 120 / Traefik)
 # Rechte: chmod 750, chown root:root
 #
-# Version: 0.8.0
+# Version: 0.8.1
 # Abhängigkeiten: curl, jq, openssl, inotifywait (inotify-tools), ssh, scp
 # =============================================================================
 set -euo pipefail
@@ -203,11 +203,21 @@ zone_exists() {
   pdns_get "/servers/localhost/zones/${1}." 2>/dev/null | grep -q '"id"'
 }
 
-zone_has_mx() {
-  # Prüft, ob eine Zone (noch) einen MX-Record trägt — der zuverlässige
-  # Indikator dafür, dass für die Domain aktiv Mail konfiguriert ist.
-  pdns_get "/servers/localhost/zones/${1}." 2>/dev/null \
-    | jq -e '.rrsets[]? | select(.type == "MX")' >/dev/null 2>&1
+zone_foreign_records() {
+  # Gibt alle RRsets einer Zone aus ("name type"), die NICHT von add-web für
+  # die Apex-Domain selbst stammen (SOA/NS am Apex, A/AAAA am Apex und www).
+  # Alles andere (MX, SRV, TXT, weitere Subdomains, ...) wurde separat
+  # angelegt und darf beim automatischen Aufräumen nicht verloren gehen.
+  # Exit-Code 1 auch, wenn die Zone nicht gelesen werden konnte.
+  local zone_json
+  zone_json=$(pdns_get "/servers/localhost/zones/${1}." 2>/dev/null) || return 1
+  jq -r --arg apex "${1}." --arg www "www.${1}." '
+    .rrsets[]
+    | select(
+        ((.name == $apex) and (.type == "SOA" or .type == "NS")) or
+        ((.name == $apex or .name == $www) and (.type == "A" or .type == "AAAA"))
+        | not)
+    | "\(.name) \(.type)"' <<< "$zone_json"
 }
 
 get_zone_for_domain() {
@@ -1702,19 +1712,37 @@ cmd_hestia_sync() {
     || die_notify "dns-mgr: hestia-sync fehlgeschlagen" "HestiaCP-API: ungültige Antwort"
 
   # Aktuelle Domains als JSON: { "user": ["domain1", "domain2"], ... }
-  local current_json="{}"
-  while IFS= read -r huser; do
-    [[ -z "$huser" ]] && continue
-    local user_domains
-    user_domains=$(curl -sk -X POST "${HESTIA_API}" \
-      --data "${hestia_auth}&cmd=v-list-web-domains&arg1=${huser}&arg2=json" \
-      | jq -r 'keys[]' 2>/dev/null | jq -R . | jq -s .) || continue
-    current_json=$(echo "$current_json" \
-      | jq --arg u "$huser" --argjson d "$user_domains" '.[$u] = $d')
-  done <<< "$all_users"
+  [[ -z "$all_users" ]] \
+    && die_notify "dns-mgr: hestia-sync fehlgeschlagen" "HestiaCP-API: leere Userliste"
 
   local known_json
   known_json=$(cat "$HESTIA_STATE")
+
+  # Schlägt die Abfrage für einen User fehl (Timeout, Hestia-Backup läuft,
+  # Fehlertext statt JSON), werden dessen bisher bekannte Domains übernommen.
+  # Früher landete der User dann mit [] (bzw. gar nicht) in current_json —
+  # alle seine Domains galten als entfernt, Zonen wurden gelöscht und im
+  # nächsten Lauf leer neu angelegt.
+  local current_json="{}"
+  while IFS= read -r huser; do
+    [[ -z "$huser" ]] && continue
+    local ud_response ud_code ud_body user_domains
+    ud_response=$(curl -sk --max-time 30 -X POST "${HESTIA_API}" \
+      --data "${hestia_auth}&cmd=v-list-web-domains&arg1=${huser}&arg2=json" \
+      -w $'\n%{http_code}') || true
+    ud_code="${ud_response##*$'\n'}"
+    ud_body="${ud_response%$'\n'*}"
+    if [[ "$ud_code" == "200" ]] \
+        && user_domains=$(jq -ce 'if type == "object" then keys else error end' \
+             <<< "$ud_body" 2>/dev/null); then
+      :
+    else
+      warn "HestiaCP: Domains von User ${huser} nicht abrufbar (HTTP ${ud_code}) — bisheriger Stand bleibt"
+      user_domains=$(jq -c --arg u "$huser" '.[$u] // []' <<< "$known_json")
+    fi
+    current_json=$(echo "$current_json" \
+      | jq --arg u "$huser" --argjson d "$user_domains" '.[$u] = $d')
+  done <<< "$all_users"
 
   # Neue Domains = in current aber nicht in known
   local new_domains
@@ -1762,18 +1790,26 @@ cmd_hestia_sync() {
 
       # DNS aufräumen: eigene A/AAAA(+www)-Records der Domain betreffen nie
       # Mail (liegt auf eigenen Namen: mail.*, autoconfig.*, MX bei @). Ist die
-      # Domain selbst eine dedizierte Zone, wird die komplette Zone gelöscht,
-      # aber nur wenn kein MX-Record (mehr) existiert — sonst bleibt sie erhalten.
+      # Domain selbst eine dedizierte Zone, wird die komplette Zone nur gelöscht,
+      # wenn sie ausschließlich die von add-web angelegten Records enthält —
+      # sonst werden nur diese entfernt und die Zone (MX, SRV, ...) bleibt.
       local zone; zone=$(get_zone_for_domain "$domain")
       if [[ -z "$zone" ]]; then
         : # keine Zone (mehr) vorhanden
       elif [[ "$domain" == "$zone" ]]; then
-        if zone_has_mx "$zone"; then
-          log "Zone ${zone} hat weiterhin einen MX-Record — bleibt erhalten"
+        local foreign
+        if ! foreign=$(zone_foreign_records "$zone"); then
+          warn "Zone ${zone} nicht lesbar — wird nicht angefasst"
+        elif [[ -n "$foreign" ]]; then
+          delete_record "$zone" "@"   "A"
+          delete_record "$zone" "@"   "AAAA"
+          delete_record "$zone" "www" "A"
+          delete_record "$zone" "www" "AAAA"
+          log "Zone ${zone} enthält weitere Records ($(echo "$foreign" | wc -l)) — bleibt erhalten, nur Web-Records entfernt"
         elif pdns_delete_zone "$zone" >/dev/null 2>&1; then
-          log "Zone ${zone} gelöscht (kein MX-Record mehr vorhanden)"
+          log "Zone ${zone} gelöscht (keine weiteren Records vorhanden)"
           notify "dns-mgr: Zone automatisch gelöscht" \
-            "Zone ${zone} wurde gelöscht — Domain wurde in HestiaCP entfernt und hatte keinen MX-Record mehr."
+            "Zone ${zone} wurde gelöscht — Domain wurde in HestiaCP entfernt und die Zone enthielt keine weiteren Records."
         else
           warn "Zone ${zone} konnte nicht gelöscht werden"
         fi
