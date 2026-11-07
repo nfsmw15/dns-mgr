@@ -180,6 +180,8 @@ dns-mgr add-service old.example.com 192.168.1.100 80 --redirect=https://new.exam
 dns-mgr edit cloud.example.com                         # nur Anzeige der aktuellen Config
 dns-mgr edit cloud.example.com --port=8081              # nur Port ändern
 dns-mgr edit phpmyadmin.example.com --no-prefix         # Prefix entfernen
+dns-mgr edit cp.example.com --extra-path=/phpmyadmin:192.168.1.118:80   # Extra-Pfad hinzufügen
+dns-mgr edit cp.example.com --no-extra-path=/phpmyadmin                 # Extra-Pfad entfernen
 
 # SRV-Record setzen:
 dns-mgr add-srv example.com mumble tcp 0 10 64738 mumble.example.com
@@ -434,7 +436,7 @@ Nach `systemctl reload nginx` sehen PHP und die nginx Access Logs die echte Clie
 | `--basic-auth=user:hash` | HTTP Basic Authentication vorschalten (Hash via `htpasswd -nb user pw`) |
 | `--redirect=https://ziel` | URL-Weiterleitung zur Ziel-URL |
 | `--internal` | DNS zeigt auf interne Backend-IP — kein Traefik, nur über VPN erreichbar |
-| `--extra-path=/pfad:ip:port[:insecure]` | Zusätzlichen Pfad mit separatem Backend zur Route hinzufügen |
+| `--extra-path=/pfad:ip:port[:insecure]` | Zusätzlichen Pfad mit separatem Backend zur Route hinzufügen (mehrfach möglich; erbt HSTS und Basic-Auth der Hauptroute) |
 
 ---
 

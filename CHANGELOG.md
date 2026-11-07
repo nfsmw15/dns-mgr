@@ -5,15 +5,20 @@ Alle wichtigen Änderungen an dns-mgr werden in dieser Datei dokumentiert.
 Das Format basiert auf [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 das Projekt folgt [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.2] - 2026-11-07
 
 ### Hinzugefügt
+- **`edit` kennt Extra-Pfade:** `--extra-path=/pfad:ip:port[:insecure]` fügt einen hinzu (gleicher Pfad wird ersetzt), `--no-extra-path=/pfad` bzw. `--no-extra-paths` entfernt einen bzw. alle. Die Anzeige von `edit <domain>` listet vorhandene Extra-Pfade mit auf.
 - **Englische Dokumentation** als `README.en.md`, mit Sprachumschalter in beiden READMEs. Dazu ein Hinweis, welche Komponenten zwingend sind (PowerDNS + Traefik) und welche optional (HestiaCP, Mailcow, pfSense).
 
 ### Geändert
 - `LICENSE` enthält jetzt den vollständigen, unveränderten AGPL-3.0-Text statt nur des Lizenzhinweises — GitHub erkennt die Lizenz dadurch korrekt (vorher „Other“). Der Copyright-Hinweis steht weiterhin im Script-Header und in der README.
 
 ### Behoben
+- **`add-service --extra-path` erzeugte eine kaputte Traefik-Config.** Der Extra-Router wurde per `cat >>` ans Dateiende gehängt — also unterhalb von `services:` statt unter `routers:`, gefolgt von einem zweiten `services:`-Key. Traefik las den Router dadurch als ungültigen Service bzw. verwarf den Haupt-Service. Fix: `write_traefik_http` baut Extra-Router und -Services jetzt direkt in die jeweiligen Blöcke ein. Bestehende, von Hand korrigierte Configs (z.B. `cp-nfsmw15-de.yml` mit `-pma`-Router) werden beim Auslesen erkannt.
+- **`edit` löschte Extra-Pfade.** `edit` schreibt die Traefik-Config komplett neu, gab vorhandene Extra-Pfade aber nicht weiter — jeder `edit`-Aufruf entfernte z.B. den phpMyAdmin-Router. Jetzt werden sie aus der YAML gelesen und beibehalten.
+- **Extra-Pfade umgingen `--basic-auth`.** Der Extra-Router hatte keine Middlewares, ein Passwortschutz der Hauptroute galt für den Pfad also nicht. Extra-Router erben jetzt `https-forward`, `hsts` (falls aktiv) und die Basic-Auth der Hauptroute.
+- `--extra-path` bei `--no-traefik`/`--type=tcp` hängte Router an eine nicht existierende bzw. die TCP-Config an — wird jetzt mit Warnung ignoriert. Ungültige Angaben (ohne führendes `/`, fehlender Port) brechen mit Fehlermeldung ab.
 - Fehlten `MAILCOW_IP` oder `HESTIA_IP` komplett in der Config (statt leer gesetzt), brach das Script wegen `set -u` schon beim Start ab — auch bei Befehlen, die weder HestiaCP noch Mailcow nutzen.
 
 ## [0.8.1] - 2026-11-07

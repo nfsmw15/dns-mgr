@@ -182,6 +182,8 @@ dns-mgr add-service old.example.com 192.168.1.100 80 --redirect=https://new.exam
 dns-mgr edit cloud.example.com                         # just show the current config
 dns-mgr edit cloud.example.com --port=8081              # change only the port
 dns-mgr edit phpmyadmin.example.com --no-prefix         # remove the prefix
+dns-mgr edit cp.example.com --extra-path=/phpmyadmin:192.168.1.118:80   # add an extra path
+dns-mgr edit cp.example.com --no-extra-path=/phpmyadmin                 # remove an extra path
 
 # Set an SRV record:
 dns-mgr add-srv example.com mumble tcp 0 10 64738 mumble.example.com
@@ -438,7 +440,7 @@ After `systemctl reload nginx`, PHP and the nginx access logs see the real clien
 | `--basic-auth=user:hash` | Put HTTP basic authentication in front (hash via `htpasswd -nb user pw`) |
 | `--redirect=https://target` | Redirect to the target URL |
 | `--internal` | DNS points to the internal backend IP — no Traefik, reachable via VPN only |
-| `--extra-path=/path:ip:port[:insecure]` | Add an extra path with a separate backend to the route |
+| `--extra-path=/path:ip:port[:insecure]` | Add an extra path with a separate backend to the route (repeatable; inherits HSTS and basic auth of the main route) |
 
 ---
 

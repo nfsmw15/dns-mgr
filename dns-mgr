@@ -19,7 +19,7 @@
 # Ort:    /usr/local/bin/dns-mgr  (LXC 120 / Traefik)
 # Rechte: chmod 750, chown root:root
 #
-# Version: 0.8.1
+# Version: 0.8.2
 # Abhängigkeiten: curl, jq, openssl, inotifywait (inotify-tools), ssh, scp
 # =============================================================================
 set -euo pipefail
@@ -344,12 +344,20 @@ write_traefik_http() {
   # --strip-prefix=/pfad:    Pfad aus dem Request entfernen bevor er ans Backend geht
   # --basic-auth=user:hash:  HTTP Basic Authentication (Passwort als htpasswd-Hash)
   # --redirect=https://ziel: URL-Weiterleitung
+  # --extra-path=/pfad:ip:port[:insecure]  (mehrfach möglich)
+  #                          Eigener Router (Host + PathPrefix) mit eigenem
+  #                          Backend, z.B. /phpmyadmin auf Port 80 neben dem
+  #                          Hestia-Panel. Erbt https-forward, hsts und eine
+  #                          gesetzte --basic-auth der Hauptroute (sonst wäre
+  #                          der Pfad am Passwortschutz vorbei erreichbar).
   local service_name="$1"; shift
   local domains=() backend_url="" sep=0 insecure=0
   local prefix="" strip_prefix="" basic_auth="" redirect_url=""
+  local extra_paths=()
 
   for arg in "$@"; do
     if [[ "$arg" == "--" ]];             then sep=1; continue; fi
+    if [[ "$arg" == --extra-path=* ]];   then extra_paths+=("${arg#--extra-path=}"); continue; fi
     if [[ "$arg" == "--insecure" ]];     then insecure=1; continue; fi
     if [[ "$arg" == --prefix=* ]];       then prefix="${arg#--prefix=}"; continue; fi
     if [[ "$arg" == --strip-prefix=* ]]; then strip_prefix="${arg#--strip-prefix=}"; continue; fi
@@ -413,6 +421,46 @@ write_traefik_http() {
     middlewares_section="  middlewares:${middleware_block}"
   fi
 
+  # Extra-Pfade: Router/Services direkt in die jeweiligen Blöcke einbauen.
+  # (Früher per cat >> ans Dateiende gehängt — landete dadurch unter
+  # services: und erzeugte einen doppelten services:-Key.)
+  local extra_routers="" extra_services=""
+  local extra_mw="https-forward"
+  [[ -n "${HSTS_MAX_AGE:-}" ]] && extra_mw+=", hsts"
+  [[ -n "$basic_auth"      ]] && extra_mw+=", ${service_name}-auth"
+  local host_rule="$rule"
+  [[ ${#domains[@]} -gt 1 ]] && host_rule="(${rule})"
+  local -A seen_ep=()
+  local ep ep_path ep_ip ep_port ep_ins ep_name ep_url
+  for ep in "${extra_paths[@]}"; do
+    ep_path="" ep_ip="" ep_port="" ep_ins=""
+    IFS=: read -r ep_path ep_ip ep_port ep_ins <<< "$ep"
+    [[ "$ep_path" == /* && -n "$ep_ip" && "$ep_port" =~ ^[0-9]+$ ]] \
+      && [[ -z "$ep_ins" || "$ep_ins" == "insecure" ]] \
+      || die "--extra-path: ungültiges Format '${ep}' — erwartet /pfad:ip:port[:insecure]"
+    ep_name="${service_name}-$(path_slug "$ep_path")"
+    [[ -n "${seen_ep[$ep_name]+x}" ]] && die "--extra-path: '${ep_path}' doppelt angegeben"
+    seen_ep["$ep_name"]=1
+    ep_url="http://${ep_ip}:${ep_port}"
+    [[ "$ep_ins" == "insecure" ]] && ep_url="https://${ep_ip}:${ep_port}"
+    extra_routers+="
+    ${ep_name}:
+      rule: \"${host_rule} && PathPrefix(\`${ep_path}\`)\"
+      entryPoints: [websecure]
+      tls:
+        certResolver: ${ACME_RESOLVER}
+      middlewares: [${extra_mw}]
+      service: ${ep_name}"
+    extra_services+="
+    ${ep_name}:
+      loadBalancer:
+        servers:
+          - url: \"${ep_url}\""
+    [[ "$ep_ins" == "insecure" ]] && extra_services+="
+        serversTransport: insecure"
+    log "Extra-Pfad: ${domains[0]}${ep_path} → ${ep_url}"
+  done
+
   log "Traefik HTTP: ${service_name} → ${backend_url}$([ $insecure -eq 1 ] && echo ' (insecure)')$([ -n "$prefix" ] && echo " (prefix: ${prefix})")$([ -n "$strip_prefix" ] && echo " (strip: ${strip_prefix})")$([ -n "$basic_auth" ] && echo ' (basic-auth)')$([ -n "$redirect_url" ] && echo " (redirect: ${redirect_url})")"
 
   atomic_write_traefik "${TRAEFIK_CONF_DIR}/${service_name}.yml" <<EOF
@@ -424,15 +472,49 @@ http:
       tls:
         certResolver: ${ACME_RESOLVER}
       middlewares: ${middlewares_yaml}
-      service: ${service_name}
+      service: ${service_name}${extra_routers}
 ${middlewares_section}
   services:
     ${service_name}:
       loadBalancer:
         servers:
           - url: "${backend_url}"
-${transport_line}
+${transport_line}${extra_services}
 EOF
+}
+
+path_slug() {
+  # /phpmyadmin → phpmyadmin, /api/v2 → api-v2 (für Router-/Service-Namen)
+  local s
+  s=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | tr -s '-')
+  s="${s#-}"; s="${s:0:30}"; s="${s%-}"
+  printf '%s' "${s:-root}"
+}
+
+traefik_read_extra_paths() {
+  # Liest Extra-Pfade (Router mit PathPrefix) aus einer Traefik-YAML und gibt
+  # sie im --extra-path-Format aus: /pfad:ip:port[:insecure], sortiert.
+  # Erkennt auch von Hand angelegte Router mit abweichendem Namen (z.B. -pma),
+  # solange die Struktur der von write_traefik_http entspricht.
+  awk '
+    /^  routers:/  { sec = "r"; next }
+    /^  services:/ { sec = "s"; next }
+    /^  [^ ]/      { sec = ""; next }
+    /^    [^ ]/    { name = $1; sub(/:$/, "", name); next }
+    sec == "r" && /^      rule:/ && match($0, /PathPrefix\(`[^`]+`\)/) {
+      path[name] = substr($0, RSTART + 12, RLENGTH - 14)
+    }
+    sec == "r" && /^      service:/ { svc[name] = $2 }
+    sec == "s" && /^          - url:/ { u = $3; gsub(/"/, "", u); url[name] = u }
+    sec == "s" && /^        serversTransport: insecure/ { ins[name] = 1 }
+    END {
+      for (r in path) {
+        s = (r in svc) ? svc[r] : r
+        u = url[s]; if (u == "") continue
+        hp = u; sub(/^[a-z]+:\/\//, "", hp); sub(/\/.*$/, "", hp)
+        print path[r] ":" hp ((u ~ /^https:/ || ins[s]) ? ":insecure" : "")
+      }
+    }' "$1" | sort
 }
 
 write_traefik_http_san() {
@@ -1079,6 +1161,10 @@ cmd_add_service() {
   local insecure_flag=""
   [[ $insecure -eq 1 ]] && insecure_flag="--insecure"
 
+  if [[ ${#extra_paths[@]} -gt 0 && ( $no_traefik -eq 1 || "$type" == "tcp" ) ]]; then
+    warn "--extra-path wird ignoriert — nur bei HTTP-Diensten mit Traefik-Route möglich"
+  fi
+
   if [[ $no_traefik -eq 1 ]]; then
     log "Traefik übersprungen (--no-traefik) — Dienst läuft direkt per NAT"
   elif [[ "$type" == "tcp" ]]; then
@@ -1087,46 +1173,15 @@ cmd_add_service() {
   else
     local backend_url="http://${backend_ip}:${backend_port}"
     [[ $insecure -eq 1 ]] && backend_url="https://${backend_ip}:${backend_port}"
-    local extra_flags=""
-    [[ -n "$prefix"       ]] && extra_flags+=" --prefix=${prefix}"
-    [[ -n "$strip_prefix" ]] && extra_flags+=" --strip-prefix=${strip_prefix}"
-    [[ -n "$basic_auth"   ]] && extra_flags+=" --basic-auth=${basic_auth}"
-    [[ -n "$redirect_url" ]] && extra_flags+=" --redirect=${redirect_url}"
-    write_traefik_http "$svc_name" "$domain" -- "$backend_url" $insecure_flag $extra_flags
-  fi
-
-  # --extra-path: zusätzliche Pfade mit separatem Backend zur bestehenden Route hinzufügen
-  # Format: --extra-path=/pfad:ip:port[:insecure]
-  # Beispiel: --extra-path=/phpmyadmin:192.168.1.118:80
-  if [[ ${#extra_paths[@]} -gt 0 ]]; then
-    local yml_file="${TRAEFIK_CONF_DIR}/${svc_name}.yml"
-    for ep in "${extra_paths[@]}"; do
-      local ep_path ep_ip ep_port ep_insecure=0
-      IFS=: read -r ep_path ep_ip ep_port ep_ins <<< "$ep"
-      [[ "${ep_ins:-}" == "insecure" ]] && ep_insecure=1
-      local ep_name="${svc_name}-$(echo "${ep_path//\//-}" | tr -d '-' | head -c 20)"
-      local ep_url="http://${ep_ip}:${ep_port}"
-      [[ $ep_insecure -eq 1 ]] && ep_url="https://${ep_ip}:${ep_port}"
-      local ep_transport=""
-      [[ $ep_insecure -eq 1 ]] && ep_transport="
-        serversTransport: insecure"
-
-      log "Extra-Pfad: ${domain}${ep_path} → ${ep_url}"
-      cat >> "$yml_file" <<EOF
-
-    ${ep_name}:
-      rule: "Host(\`${domain}\`) && PathPrefix(\`${ep_path}\`)"
-      entryPoints: [websecure]
-      tls:
-        certResolver: ${ACME_RESOLVER}
-      service: ${ep_name}
-  services:
-    ${ep_name}:
-      loadBalancer:
-        servers:
-          - url: "${ep_url}"${ep_transport}
-EOF
-    done
+    local http_flags=()
+    [[ -n "$insecure_flag" ]] && http_flags+=("$insecure_flag")
+    [[ -n "$prefix"       ]] && http_flags+=("--prefix=${prefix}")
+    [[ -n "$strip_prefix" ]] && http_flags+=("--strip-prefix=${strip_prefix}")
+    [[ -n "$basic_auth"   ]] && http_flags+=("--basic-auth=${basic_auth}")
+    [[ -n "$redirect_url" ]] && http_flags+=("--redirect=${redirect_url}")
+    local ep
+    for ep in "${extra_paths[@]}"; do http_flags+=("--extra-path=${ep}"); done
+    write_traefik_http "$svc_name" "$domain" -- "$backend_url" "${http_flags[@]}"
   fi
 
   if pfsense_configured && [[ $no_dns -eq 0 && $internal -eq 0 ]]; then
@@ -1151,6 +1206,14 @@ EOF
 ### ursprünglichen add-service-Befehls aus dem Gedächtnis. Ohne zusätzliche
 ### Optionen zeigt der Befehl nur die aktuelle Konfiguration an (Dry-Run).
 ### ═══════════════════════════════════════════════════════════════════════════
+
+extras_display() {
+  # Extra-Pfade für die edit-Anzeige: "/pma → 192.168.1.118:80, /api → ..."
+  [[ $# -eq 0 ]] && { printf '<keine>'; return; }
+  local out="" e
+  for e in "$@"; do out+="${out:+, }${e%%:*} → ${e#*:}"; done
+  printf '%s' "$out"
+}
 
 cmd_edit_service() {
   local domain="${1:-}"
@@ -1178,6 +1241,8 @@ cmd_edit_service() {
   cur_strip=$(grep -oP '(?<=^          - )(?!url: )[^"].*' "$yml_file" | head -1 || true)
   cur_basic_auth=$(grep -oP '(?<=^          - ")[^"]+' "$yml_file" | head -1 || true)
   cur_redirect=$(grep -oP '(?<=replacement: ")[^"]+' "$yml_file" | head -1 || true)
+  local cur_extras=()
+  mapfile -t cur_extras < <(traefik_read_extra_paths "$yml_file")
 
   local cur_a cur_aaaa
   cur_a=$(get_dns_record "$domain" "A")
@@ -1188,9 +1253,23 @@ cmd_edit_service() {
   local new_prefix="$cur_prefix" new_strip="$cur_strip"
   local new_basic_auth="$cur_basic_auth" new_redirect="$cur_redirect"
   local new_ipv6="$cur_aaaa"
+  local new_extras=("${cur_extras[@]}")
 
   for arg in "$@"; do
     case "$arg" in
+      --extra-path=*)
+        # gleicher Pfad wird ersetzt, neuer Pfad hinzugefügt
+        local spec="${arg#--extra-path=}" kept=() e
+        for e in "${new_extras[@]}"; do [[ "${e%%:*}" != "${spec%%:*}" ]] && kept+=("$e"); done
+        new_extras=("${kept[@]}" "$spec") ;;
+      --no-extra-path=*)
+        local rm_path="${arg#--no-extra-path=}" kept=() e found=0
+        for e in "${new_extras[@]}"; do
+          if [[ "${e%%:*}" == "$rm_path" ]]; then found=1; else kept+=("$e"); fi
+        done
+        [[ $found -eq 0 ]] && die "edit: Extra-Pfad '${rm_path}' ist nicht konfiguriert"
+        new_extras=("${kept[@]}") ;;
+      --no-extra-paths)  new_extras=() ;;
       --ip=*)            new_ip="${arg#--ip=}" ;;
       --port=*)          new_port="${arg#--port=}" ;;
       --ipv6=*)          new_ipv6="${arg#--ipv6=}" ;;
@@ -1221,11 +1300,12 @@ cmd_edit_service() {
   printf "  %-13s %s\n" "Strip-Prefix:" "${cur_strip:-<keiner>}"
   printf "  %-13s %s\n" "Basic-Auth:"   "${cur_auth_display}"
   printf "  %-13s %s\n" "Redirect:"     "${cur_redirect:-<keiner>}"
+  printf "  %-13s %s\n" "Extra-Pfade:"  "$(extras_display "${cur_extras[@]}")"
 
   if [[ $# -eq 0 ]]; then
     echo ""
     log "Nur Anzeige — keine Änderungen angegeben."
-    log "Optionen: --ip= --port= --ipv6= --no-ipv6 --insecure --secure --prefix= --no-prefix --strip-prefix= --no-strip-prefix --basic-auth= --no-basic-auth --redirect= --no-redirect"
+    log "Optionen: --ip= --port= --ipv6= --no-ipv6 --insecure --secure --prefix= --no-prefix --strip-prefix= --no-strip-prefix --basic-auth= --no-basic-auth --redirect= --no-redirect --extra-path=/pfad:ip:port[:insecure] --no-extra-path=/pfad --no-extra-paths"
     return 0
   fi
 
@@ -1237,6 +1317,7 @@ cmd_edit_service() {
   printf "  %-13s %s\n" "Strip-Prefix:" "${new_strip:-<keiner>}"
   printf "  %-13s %s\n" "Basic-Auth:"   "${new_auth_display}"
   printf "  %-13s %s\n" "Redirect:"     "${new_redirect:-<keiner>}"
+  printf "  %-13s %s\n" "Extra-Pfade:"  "$(extras_display "${new_extras[@]}")"
   echo ""
 
   local flags=()
@@ -1247,6 +1328,8 @@ cmd_edit_service() {
   [[ -n "$new_strip"      ]] && flags+=("--strip-prefix=${new_strip}")
   [[ -n "$new_basic_auth" ]] && flags+=("--basic-auth=${new_basic_auth}")
   [[ -n "$new_redirect"   ]] && flags+=("--redirect=${new_redirect}")
+  local e
+  for e in "${new_extras[@]}"; do flags+=("--extra-path=${e}"); done
 
   log "Wende Änderungen an (DNS REPLACE + Traefik-Config neu schreiben) ..."
   cmd_add_service "$domain" "$new_ip" "$new_port" "${flags[@]}"
@@ -2296,6 +2379,10 @@ DOMAIN-VERWALTUNG
       --strip-prefix=/pfad      Pfad aus dem Request entfernen bevor er ans Backend geht
       --basic-auth=user:hash    HTTP Basic Authentication (Hash via: htpasswd -nb user pw)
       --redirect=https://ziel   URL-Weiterleitung
+      --internal                DNS auf interne Backend-IP, kein Traefik (nur VPN)
+      --extra-path=/pfad:ip:port[:insecure]
+                                Zusätzlicher Pfad mit eigenem Backend (mehrfach möglich),
+                                z.B. /phpmyadmin:192.168.1.118:80 neben dem Hestia-Panel
 
   edit <domain> [optionen]
       Liest die bestehende DNS/Traefik-Config eines add-service-Eintrags
@@ -2311,6 +2398,10 @@ DOMAIN-VERWALTUNG
       --strip-prefix=/pfad / --no-strip-prefix
       --basic-auth=user:hash / --no-basic-auth
       --redirect=https://ziel / --no-redirect
+      --extra-path=/pfad:ip:port[:insecure]
+                                Extra-Pfad hinzufügen (gleicher Pfad wird ersetzt)
+      --no-extra-path=/pfad / --no-extra-paths
+                                Einen bzw. alle Extra-Pfade entfernen
 
   remove <domain> [--force]
       Zone + Traefik-Configs löschen
